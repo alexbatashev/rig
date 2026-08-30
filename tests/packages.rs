@@ -40,6 +40,7 @@ case "$name $1" in
   "brew install")
     shift
     if [ "$1" = "--cask" ]; then shift; echo "$1" >> "$FAKE_INSTALLED"; exit 0; fi
+    [ "$1" = "mise" ] && cp "$0" "$(dirname "$0")/mise"
     if grep -qx "$1" "$FAKE_CASKS" 2>/dev/null; then echo "No available formula with the name \"$1\"" >&2; exit 1; fi
     echo "$1" >> "$FAKE_INSTALLED" ;;
   "brew uninstall")
@@ -54,6 +55,8 @@ case "$name $1" in
       remove) [ -n "$FAKE_NIX_UNKNOWN" ] && { echo "error: unknown element" >&2; exit 1; } ;;
     esac ;;
   "nix --version") echo "nix (Nix) 2.24.9" ;;
+  "mise ls") cat "$FAKE_MISE_JSON" ;;
+  "mise --version") echo "2026.1.0 macos-arm64" ;;
   "pacman -V") echo "Pacman v6.1.0" ;;
 esac
 exit 0
@@ -70,12 +73,14 @@ fn sandbox(os: &str) -> Sandbox {
         "dpkg-query",
         "brew",
         "nix",
+        "mise",
     ] {
         sb.fake_bin(tool, FAKE);
     }
     sb.set_installed(&[]);
     sb.set_repo_packages(&["ghostty", "ripgrep", "vim"]);
     sb.set_nix_json("{\"elements\":{}}");
+    sb.set_mise_json("{}");
     sb
 }
 
@@ -412,20 +417,139 @@ fn unavailable_backend_row() {
     assert!(run.stdout.contains("not on PATH"), "{}", run.stdout);
 }
 
-#[test]
-fn mise_is_reported_as_unavailable() {
-    let sb = sandbox("linux:arch");
-    sb.write_repo(
-        "modules/tools/module.toml",
-        "[packages]\nmise = [\"npm:@anthropic-ai/claude-code\"]\n",
-    );
-    let run = up(&sb, &[]);
-    assert!(run.stdout.contains("packages: mise"), "{}", run.stdout);
-    assert!(
-        run.stdout.contains("backend not available"),
-        "{}",
-        run.stdout
-    );
+mod mise {
+    use super::common::Sandbox;
+    use super::{manifest, sandbox, up};
+
+    const MODULE: &str = "[packages]\nmise = [\"gh\", \"npm:@anthropic-ai/claude-code\"]\n";
+    const RIG_TOML: &str = "# written by rig, edit module.toml instead\n[tools]\ngh = \"latest\"\n\"npm:@anthropic-ai/claude-code\" = \"latest\"\n";
+    const ALL_INSTALLED: &str =
+        r#"{"gh":[{"installed":true}],"npm:@anthropic-ai/claude-code":[{"installed":true}]}"#;
+
+    fn rig_toml(sb: &Sandbox) -> Option<String> {
+        std::fs::read_to_string(sb.root.path().join("config/mise/conf.d/rig.toml")).ok()
+    }
+
+    fn mise_calls(sb: &Sandbox) -> Vec<String> {
+        sb.log()
+            .into_iter()
+            .filter(|l| l.starts_with("mise "))
+            .collect()
+    }
+
+    #[test]
+    fn install_then_idle_then_uninstall() {
+        let sb = sandbox("linux:arch");
+        sb.write_repo("modules/tools/module.toml", MODULE);
+        let run = up(&sb, &[]);
+        assert_eq!(run.status, 0, "{}{}", run.stdout, run.stderr);
+        assert_eq!(
+            mise_calls(&sb),
+            vec!["mise ls --json --installed", "mise install"]
+        );
+        assert_eq!(rig_toml(&sb).as_deref(), Some(RIG_TOML));
+        assert!(run.stdout.contains("mise: gh"), "{}", run.stdout);
+        let m = manifest(&sb);
+        assert!(
+            m.contains("mise = [\"gh\", \"npm:@anthropic-ai/claude-code\"]"),
+            "{m}"
+        );
+
+        sb.set_mise_json(ALL_INSTALLED);
+        std::fs::write(sb.log_path(), "").unwrap();
+        up(&sb, &[]);
+        assert_eq!(mise_calls(&sb), vec!["mise ls --json --installed"]);
+
+        sb.write_repo("modules/tools/module.toml", "[packages]\nmise = [\"gh\"]\n");
+        std::fs::write(sb.log_path(), "").unwrap();
+        up(&sb, &[]);
+        assert_eq!(
+            mise_calls(&sb),
+            vec![
+                "mise ls --json --installed",
+                "mise uninstall npm:@anthropic-ai/claude-code"
+            ]
+        );
+        assert_eq!(
+            rig_toml(&sb).as_deref(),
+            Some("# written by rig, edit module.toml instead\n[tools]\ngh = \"latest\"\n")
+        );
+
+        sb.write_repo("modules/tools/module.toml", "[packages]\nmise = []\n");
+        up(&sb, &[]);
+        assert_eq!(rig_toml(&sb), None);
+    }
+
+    #[test]
+    fn preinstalled_tool_is_never_tracked_or_removed() {
+        let sb = sandbox("linux:arch");
+        sb.write_repo("modules/tools/module.toml", MODULE);
+        sb.set_mise_json(r#"{"npm:@anthropic-ai/claude-code":[{"installed":true}]}"#);
+        up(&sb, &[]);
+        let m = manifest(&sb);
+        assert!(m.contains("mise = [\"gh\"]"), "{m}");
+
+        sb.write_repo("modules/tools/module.toml", "[packages]\nmise = []\n");
+        std::fs::write(sb.log_path(), "").unwrap();
+        up(&sb, &[]);
+        assert!(
+            !sb.log().iter().any(|l| l.starts_with("mise uninstall")),
+            "{:?}",
+            sb.log()
+        );
+    }
+
+    #[test]
+    fn dry_run_leaves_config_alone() {
+        let sb = sandbox("linux:arch");
+        sb.write_repo("modules/tools/module.toml", MODULE);
+        up(&sb, &["-n"]);
+        assert_eq!(rig_toml(&sb), None);
+        assert_eq!(mise_calls(&sb), vec!["mise ls --json --installed"]);
+    }
+
+    #[test]
+    fn brew_installs_mise_then_mise_installs_tools() {
+        let sb = sandbox("macos");
+        sb.remove_fake_bin("mise");
+        sb.write_repo(
+            "modules/tools/module.toml",
+            "[packages]\nmacos = [\"mise\"]\nmise = [\"gh\"]\n",
+        );
+        let run = up(&sb, &[]);
+        assert_eq!(run.status, 0, "{}{}", run.stdout, run.stderr);
+        let log = sb.log().join("\n");
+        assert!(log.contains("brew install mise"), "{log}");
+        assert!(log.contains("mise install"), "{log}");
+        assert!(run.stdout.contains("mise: gh"), "{}", run.stdout);
+    }
+
+    #[test]
+    fn unavailable_row_when_mise_missing() {
+        let sb = sandbox("linux:arch");
+        sb.remove_fake_bin("mise");
+        sb.write_repo("modules/tools/module.toml", MODULE);
+        let run = up(&sb, &[]);
+        assert!(run.stdout.contains("packages: mise"), "{}", run.stdout);
+        assert!(run.stdout.contains("not on PATH"), "{}", run.stdout);
+    }
+
+    #[test]
+    fn doctor_reports_version_and_path() {
+        let sb = sandbox("linux:arch");
+        let run = sb.rig(&["doctor", sb.repo.to_str().unwrap()]);
+        assert!(run.stdout.contains("mise: 2026.1.0"), "{}", run.stdout);
+        assert!(
+            run.stderr.contains("mise: tools not on PATH"),
+            "{}",
+            run.stderr
+        );
+
+        sb.remove_fake_bin("mise");
+        let run = sb.rig(&["doctor", sb.repo.to_str().unwrap()]);
+        assert!(run.stdout.contains("mise: not available"), "{}", run.stdout);
+        assert!(!run.stderr.contains("mise:"), "{}", run.stderr);
+    }
 }
 
 #[test]

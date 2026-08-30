@@ -4,6 +4,7 @@ pub mod apt;
 pub mod arch;
 pub mod brew;
 pub mod keel;
+pub mod mise;
 pub mod nix;
 
 use crate::exec::{Confirm, Policy};
@@ -19,6 +20,14 @@ pub trait PackageBackend {
     /// Whether the tool this backend drives is on this machine.
     fn available(&self) -> bool;
     fn version(&self, policy: Policy) -> Option<String>;
+    /// Told the full desired set before anything is queried, for backends that
+    /// keep a config file of their own.
+    ///
+    /// # Errors
+    /// When that file cannot be written.
+    fn desired(&mut self, _want: &BTreeSet<String>) -> Result<()> {
+        Ok(())
+    }
     /// The subset of `names` installed right now.
     ///
     /// # Errors
@@ -47,7 +56,7 @@ pub fn names_of(listing: &str, wanted: &BTreeSet<String>) -> BTreeSet<String> {
         .collect()
 }
 
-/// The native backend for this OS, then nix everywhere.
+/// The native backend for this OS, then nix and mise everywhere.
 #[must_use]
 pub fn backends_for(os: &Os, casks: BTreeSet<String>) -> Vec<Box<dyn PackageBackend>> {
     let mut out: Vec<Box<dyn PackageBackend>> = Vec::new();
@@ -61,6 +70,7 @@ pub fn backends_for(os: &Os, casks: BTreeSet<String>) -> Vec<Box<dyn PackageBack
         out.push(Box::new(keel::Keel));
     }
     out.push(Box::new(nix::Nix));
+    out.push(Box::new(mise::Mise));
     out
 }
 
@@ -92,9 +102,6 @@ pub fn sync(
     opts: Options,
 ) -> Result<Report> {
     let mut report = Report::default();
-    if !wanted(sel, Backend::Mise).is_empty() {
-        report.push(Row::new("skipped", "packages: mise").module("backend not available"));
-    }
     let mut backends = backends_for(os, state.macos_casks.clone());
     for backend in &mut backends {
         let kind = backend.kind();
@@ -119,6 +126,12 @@ pub fn sync(
     Ok(report)
 }
 
+fn error_row(kind: Backend, e: &anyhow::Error) -> Row {
+    Row::new("error", &format!("packages: {kind}"))
+        .note(&format!("{e:#}"))
+        .exit(2)
+}
+
 fn step(
     backend: &mut dyn PackageBackend,
     want: &BTreeSet<String>,
@@ -132,12 +145,20 @@ fn step(
     let present = match backend.installed(&query, opts.policy) {
         Ok(p) => p,
         Err(e) => {
-            report.push(
-                Row::new("error", &format!("packages: {kind}"))
-                    .note(&format!("{e:#}"))
-                    .exit(2),
-            );
+            report.push(error_row(kind, &e));
             return;
+        }
+    };
+    let prepare = |backend: &mut dyn PackageBackend, report: &mut Report| {
+        if opts.dry_run {
+            return true;
+        }
+        match backend.desired(want) {
+            Ok(()) => true,
+            Err(e) => {
+                report.push(error_row(kind, &e));
+                false
+            }
         }
     };
     let to_add: Vec<String> = want.difference(&present).cloned().collect();
@@ -149,6 +170,9 @@ fn step(
     let to_remove: Vec<String> = unwanted.intersection(&present).cloned().collect();
 
     if to_add.is_empty() && to_remove.is_empty() {
+        if !prepare(backend, report) {
+            return;
+        }
         let mut row = Row::new("package", &format!("{kind}: {} ok", want.len()));
         row.quiet = true;
         report.push(row);
@@ -181,6 +205,9 @@ fn step(
         );
         return;
     }
+    if !prepare(backend, report) {
+        return;
+    }
 
     if !to_add.is_empty() {
         if let Err(e) = backend.install(&to_add, opts.policy) {
@@ -192,11 +219,7 @@ fn step(
                 report.push(Row::new("package", &format!("{kind}: {n}")).module("installed"));
             }
             tracked.extend(landed);
-            report.push(
-                Row::new("error", &format!("packages: {kind}"))
-                    .note(&format!("{e:#}"))
-                    .exit(2),
-            );
+            report.push(error_row(kind, &e));
             state.packages.insert(kind, tracked);
             return;
         }
@@ -213,11 +236,7 @@ fn step(
                     report.push(Row::new("package", &format!("{kind}: {n}")).module("removed"));
                 }
             }
-            Err(e) => report.push(
-                Row::new("error", &format!("packages: {kind}"))
-                    .note(&format!("{e:#}"))
-                    .exit(2),
-            ),
+            Err(e) => report.push(error_row(kind, &e)),
         }
     }
     state.packages.insert(kind, tracked);
@@ -231,6 +250,7 @@ pub fn doctor_lines(policy: Policy) -> Vec<String> {
         Box::new(apt::Apt),
         Box::new(brew::Brew::new(BTreeSet::new())),
         Box::new(nix::Nix),
+        Box::new(mise::Mise),
     ];
     all.iter()
         .map(|b| {
@@ -250,18 +270,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backends_are_native_then_nix() {
+    fn backends_are_native_then_nix_then_mise() {
         let kinds = |spec: &str| -> Vec<Backend> {
             backends_for(&Os::parse(spec), BTreeSet::new())
                 .iter()
                 .map(|b| b.kind())
                 .collect()
         };
-        assert_eq!(kinds("linux:arch"), vec![Backend::Arch, Backend::Nix]);
-        assert_eq!(kinds("linux:ubuntu"), vec![Backend::Ubuntu, Backend::Nix]);
-        assert_eq!(kinds("macos"), vec![Backend::Macos, Backend::Nix]);
-        assert_eq!(kinds("linux:keel"), vec![Backend::Keel, Backend::Nix]);
-        assert_eq!(kinds("linux:void"), vec![Backend::Nix]);
+        assert_eq!(
+            kinds("linux:arch"),
+            vec![Backend::Arch, Backend::Nix, Backend::Mise]
+        );
+        assert_eq!(
+            kinds("linux:ubuntu"),
+            vec![Backend::Ubuntu, Backend::Nix, Backend::Mise]
+        );
+        assert_eq!(
+            kinds("macos"),
+            vec![Backend::Macos, Backend::Nix, Backend::Mise]
+        );
+        assert_eq!(
+            kinds("linux:keel"),
+            vec![Backend::Keel, Backend::Nix, Backend::Mise]
+        );
+        assert_eq!(kinds("linux:void"), vec![Backend::Nix, Backend::Mise]);
     }
 
     #[test]

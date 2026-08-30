@@ -187,6 +187,11 @@ impl Sandbox {
         std::fs::write(self.root.path().join("fake.nix.json"), json).unwrap();
     }
 
+    /// What the fake `mise ls --json` answers.
+    pub fn set_mise_json(&self, json: &str) {
+        std::fs::write(self.root.path().join("fake.mise.json"), json).unwrap();
+    }
+
     pub fn remove_fake_bin(&self, name: &str) {
         let _ = std::fs::remove_file(self.root.path().join("bin").join(name));
     }
@@ -215,7 +220,10 @@ impl Sandbox {
             .env("FAKE_REPO", self.root.path().join("fake.repo"))
             .env("FAKE_CASKS", self.root.path().join("fake.casks"))
             .env("FAKE_NIX_JSON", self.root.path().join("fake.nix.json"))
+            .env("FAKE_MISE_JSON", self.root.path().join("fake.mise.json"))
             .envs(self.env.clone())
+            .env_remove("MISE_SHELL")
+            .env_remove("MISE_DATA_DIR")
             .env_remove("EDITOR")
             .env_remove("VISUAL")
             .output()

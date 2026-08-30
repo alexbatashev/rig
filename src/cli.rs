@@ -704,6 +704,7 @@ fn doctor(root: &Path) -> i32 {
     }
     warnings.extend(unknown_variant_tags(&repo));
     warnings.extend(ini_case_collisions(&repo));
+    warnings.extend(packages::mise::path_warning());
     for w in &warnings {
         eprintln!("warning: {w}");
     }
