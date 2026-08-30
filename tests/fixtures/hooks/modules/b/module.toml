@@ -1,0 +1,3 @@
+[[hook]]
+after = "hookrun b"
+when = "always"

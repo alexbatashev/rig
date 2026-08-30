@@ -12,6 +12,8 @@ pub struct Row {
     /// This row's contribution to the exit code.
     pub exit: i32,
     pub quiet: bool,
+    /// Whether this row put bytes on disk, which is what a `changed` hook waits for.
+    pub wrote: bool,
 }
 
 impl Row {
@@ -24,6 +26,7 @@ impl Row {
             note: None,
             exit: 0,
             quiet: false,
+            wrote: false,
         }
     }
 
@@ -36,6 +39,13 @@ impl Row {
     #[must_use]
     pub fn note(mut self, note: &str) -> Row {
         self.note = Some(note.to_string());
+        self
+    }
+
+    /// The same row, printed only under `-v` because someone else already showed it.
+    #[must_use]
+    pub fn quietly(mut self) -> Row {
+        self.quiet = true;
         self
     }
 
@@ -61,6 +71,7 @@ impl Row {
             note: plan.note.clone(),
             exit,
             quiet: plan.outcome.is_quiet() || forgotten,
+            wrote: matches!(plan.action, Action::Write { .. }),
         }
     }
 }

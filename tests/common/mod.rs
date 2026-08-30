@@ -9,6 +9,32 @@ pub struct Sandbox {
     pub home: PathBuf,
     pub repo: PathBuf,
     pub os: String,
+    env: std::collections::BTreeMap<String, String>,
+}
+
+/// The only system programs a sandboxed run may reach. Everything else must be faked,
+/// so a test can never invoke the real package manager.
+const SYSTEM_TOOLS: &[&str] = &[
+    "sh", "bash", "env", "printf", "basename", "dirname", "cat", "grep", "sed", "mv", "cp", "rm",
+    "ls", "head", "tail", "sort", "wc", "chmod", "mkdir", "true", "false", "uname", "git",
+];
+
+fn link_system_tools(into: &Path) {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    for tool in SYSTEM_TOOLS {
+        let found = std::env::split_paths(&path)
+            .map(|d| d.join(tool))
+            .find(|p| p.is_file())
+            .unwrap_or_else(|| panic!("the sandbox needs {tool} on PATH"));
+        let _ = std::os::unix::fs::symlink(found, into.join(tool));
+    }
+}
+
+fn write_script(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::remove_file(path);
+    std::fs::write(path, body).unwrap();
+    std::fs::set_permissions(path, PermissionsExt::from_mode(0o755)).unwrap();
 }
 
 fn copy_dir(from: &Path, to: &Path) {
@@ -39,14 +65,24 @@ impl Sandbox {
         let root = TempDir::new().unwrap();
         let home = root.path().join("home");
         let repo = root.path().join("repo");
-        for d in [&home, &repo, &root.path().join("bin")] {
+        for d in [
+            &home,
+            &repo,
+            &root.path().join("bin"),
+            &root.path().join("sysbin"),
+        ] {
             std::fs::create_dir_all(d).unwrap();
         }
+        link_system_tools(&root.path().join("sysbin"));
+        // The basic fixture's hypr module runs `hyprctl reload`; a test that cares
+        // about it puts its own fake in bin/, which comes first on PATH.
+        write_script(&root.path().join("sysbin/hyprctl"), "#!/bin/sh\nexit 0\n");
         Sandbox {
             root,
             home,
             repo,
             os: "linux:arch".to_string(),
+            env: std::collections::BTreeMap::new(),
         }
     }
 
@@ -119,19 +155,52 @@ impl Sandbox {
             .collect()
     }
 
+    pub fn set_env(&mut self, key: &str, value: &str) {
+        self.env.insert(key.to_string(), value.to_string());
+    }
+
+    fn write_list(&self, name: &str, lines: &[&str]) {
+        let body = lines
+            .iter()
+            .map(|l| format!("{l}\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        std::fs::write(self.root.path().join(name), body).unwrap();
+    }
+
+    /// Packages the fake package managers report as already installed.
+    pub fn set_installed(&self, names: &[&str]) {
+        self.write_list("fake.installed", names);
+    }
+
+    /// Packages the fake `pacman -Sp` recognises; everything else is AUR.
+    pub fn set_repo_packages(&self, names: &[&str]) {
+        self.write_list("fake.repo", names);
+    }
+
+    /// Names the fake `brew install` rejects as a formula.
+    pub fn set_casks(&self, names: &[&str]) {
+        self.write_list("fake.casks", names);
+    }
+
+    pub fn set_nix_json(&self, json: &str) {
+        std::fs::write(self.root.path().join("fake.nix.json"), json).unwrap();
+    }
+
+    pub fn remove_fake_bin(&self, name: &str) {
+        let _ = std::fs::remove_file(self.root.path().join("bin").join(name));
+    }
+
     /// Writes an executable script into the sandbox `bin`, which is first on `PATH`.
     pub fn fake_bin(&self, name: &str, script: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        let p = self.root.path().join("bin").join(name);
-        std::fs::write(&p, script).unwrap();
-        std::fs::set_permissions(&p, PermissionsExt::from_mode(0o755)).unwrap();
+        write_script(&self.root.path().join("bin").join(name), script);
     }
 
     pub fn rig(&self, args: &[&str]) -> Run {
         let path = format!(
             "{}:{}",
             self.root.path().join("bin").display(),
-            std::env::var("PATH").unwrap_or_default()
+            self.root.path().join("sysbin").display()
         );
         let out = Command::new(env!("CARGO_BIN_EXE_rig"))
             .args(args)
@@ -142,6 +211,11 @@ impl Sandbox {
             .env("RIG_OS", &self.os)
             .env("PATH", path)
             .env("FAKE_LOG", self.log_path())
+            .env("FAKE_INSTALLED", self.root.path().join("fake.installed"))
+            .env("FAKE_REPO", self.root.path().join("fake.repo"))
+            .env("FAKE_CASKS", self.root.path().join("fake.casks"))
+            .env("FAKE_NIX_JSON", self.root.path().join("fake.nix.json"))
+            .envs(self.env.clone())
             .env_remove("EDITOR")
             .env_remove("VISUAL")
             .output()

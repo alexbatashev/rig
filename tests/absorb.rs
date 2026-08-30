@@ -255,6 +255,11 @@ fn absorb_an_etc_target() {
         "sudo",
         "#!/bin/sh\n[ \"$1\" = \"-n\" ] && shift\n[ \"$1\" = \"--\" ] && shift\nexec \"$@\"\n",
     );
+    // Everything the fixture lists is already installed, so packages stay silent.
+    sb.fake_bin(
+        "pacman",
+        "#!/bin/sh\n[ \"$1\" = \"-Qq\" ] && printf 'fish\\nstarship\\nghostty\\nnvidia-open-dkms\\n'\nexit 0\n",
+    );
     let etc_root = sb.etc_root().to_str().unwrap().to_string();
     let repo = sb.repo.to_str().unwrap();
     sb.rig(&["up", "--host", "desktop", "--etc-root", &etc_root, repo]);

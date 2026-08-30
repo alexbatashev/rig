@@ -19,6 +19,14 @@ shift
 exec "$@"
 "#;
 
+/// Only the rows about managed files, dropping package and hook rows.
+fn file_rows(run: &common::Run) -> Vec<(String, String)> {
+    run.rows()
+        .into_iter()
+        .filter(|(_, t)| t.starts_with("~/") || t.starts_with("/etc/"))
+        .collect()
+}
+
 /// A host with no `/etc` targets, so the home phase is the whole run.
 fn home_only() -> Sandbox {
     Sandbox::with_fixture("basic").with_os("linux:ubuntu")
@@ -46,8 +54,13 @@ fn up_creates_everything_then_noop() {
     let sb = home_only();
     let first = up(&sb, &[]);
     assert_eq!(first.status, 0, "{}{}", first.stdout, first.stderr);
-    assert_eq!(first.rows().len(), 9, "{}", first.stdout);
-    assert!(first.rows().iter().all(|(o, _)| o == "created"));
+    assert_eq!(file_rows(&first).len(), 9, "{}", first.stdout);
+    assert!(file_rows(&first).iter().all(|(o, _)| o == "created"));
+    assert!(
+        first.stdout.contains("hook       hypr: hyprctl reload"),
+        "{}",
+        first.stdout
+    );
     assert_eq!(sb.mode(".local/bin/clip"), 0o755);
     assert_eq!(sb.mode(GHOSTTY), 0o644);
     assert_eq!(
@@ -265,7 +278,7 @@ fn dry_run_changes_nothing() {
     let sb = home_only();
     let run = up(&sb, &["-n"]);
     assert_eq!(run.status, 0, "{}{}", run.stdout, run.stderr);
-    assert!(run.rows().iter().all(|(o, _)| o == "created"));
+    assert!(file_rows(&run).iter().all(|(o, _)| o == "created"));
     assert!(!sb.state_dir().exists());
     assert!(!sb.home_exists(GHOSTTY));
 }
@@ -303,10 +316,12 @@ fn state_dir_deleted_recovers() {
     std::fs::remove_dir_all(sb.state_dir()).unwrap();
     let run = sb.rig(&["up"]);
     assert!(
-        run.rows().iter().all(|(o, _)| o == "adopted"),
+        file_rows(&run).iter().all(|(o, _)| o == "adopted"),
         "{}",
         run.stdout
     );
+    // Nothing was written, so the hypr hook must not fire.
+    assert!(!run.stdout.contains("hyprctl reload"), "{}", run.stdout);
     assert_eq!(sb.rig(&["up"]).stdout, "nothing to do\n");
 }
 

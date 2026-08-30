@@ -1,0 +1,5 @@
+[packages]
+arch = ["ghostty", "ripgrep"]
+ubuntu = ["ghostty"]
+macos = ["ghostty"]
+nix = ["nixpkgs#bloaty"]

@@ -3,6 +3,9 @@
 use crate::absorb::{absorb, equivalent, summary, AbsorbEdit, Lower, TopLayer};
 use crate::apply::{apply, dry_row, RealDisk};
 use crate::compose::{compose, desired, layers, Desired, Layer};
+use crate::exec::{is_root, Confirm, Policy};
+use crate::hooks::{self, run_hooks};
+use crate::packages;
 use crate::reconcile::{reconcile, Action, Disk, Force, Options, Outcome, Plan};
 use crate::repo::{load, select, Os, Repo, Roots, Selection, Sync, Target, KNOWN_OS_TAGS};
 use crate::report::{Report, Row};
@@ -435,20 +438,72 @@ fn up(args: &UpArgs, roots: &Roots, etc_root: Option<&Path>) -> Result<i32> {
             report.push(dry_row(p));
         }
     }
-    print_report(&report, args.verbose)?;
-    let exit = report.exit();
+    let mut exit = 0;
+    if !actionable.is_empty() && !args.dry_run {
+        if is_root() {
+            let mut state = etc_state;
+            let applied = apply(&actionable, roots, &etc_store, &mut state, false)?;
+            print_report(&applied, args.verbose)?;
+            exit = exit.max(applied.exit());
+            for row in applied.rows {
+                report.push(row.quietly());
+            }
+        } else {
+            let code = escalate(args, &session, etc_root, actionable.len())?;
+            exit = exit.max(code);
+            // The child printed its own rows; keep them here only so hooks see the writes.
+            if code < 2 {
+                for p in &actionable {
+                    report.push(Row::from_plan(p).quietly());
+                }
+            }
+        }
+    }
 
-    if actionable.is_empty() || args.dry_run {
-        return Ok(exit);
+    let policy = Policy {
+        no_sudo: args.no_sudo,
+        verbose: args.verbose,
+    };
+    let sel = session.selection()?;
+    let (home_store, mut home_state) = Store::open(&home_state_dir()?)?;
+    let packages = packages::sync(
+        &sel,
+        &session.os,
+        &mut home_state,
+        &home_store,
+        packages::Options {
+            confirm: Confirm { yes: args.yes },
+            policy,
+            dry_run: args.dry_run,
+        },
+    )?;
+    let written = written_by_module(&report, roots);
+    let visible = report.rows.iter().chain(&packages.rows).any(|r| !r.quiet);
+    let runs = run_hooks(&sel, &written, &roots.home, args.dry_run);
+    for row in packages.rows {
+        report.push(row);
     }
-    // SAFETY-free: geteuid has no preconditions.
-    if unsafe { libc::geteuid() } == 0 {
-        let mut state = etc_state;
-        let r = apply(&actionable, roots, &etc_store, &mut state, false)?;
-        print_report(&r, args.verbose)?;
-        return Ok(exit.max(r.exit()));
+    for row in hooks::rows(&runs, visible, args.verbose) {
+        report.push(row);
     }
-    Ok(exit.max(escalate(args, &session, etc_root, actionable.len())?))
+    print_report(&report, args.verbose)?;
+    Ok(exit.max(report.exit()))
+}
+
+/// The absolute paths `up` wrote, grouped by owning module, for `RIG_CHANGED`.
+fn written_by_module(report: &Report, roots: &Roots) -> BTreeMap<String, Vec<PathBuf>> {
+    let mut out: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    for row in &report.rows {
+        let (Some(module), Ok(target)) = (row.module.as_ref(), row.target.parse::<Target>()) else {
+            continue;
+        };
+        if row.wrote {
+            out.entry(module.clone())
+                .or_default()
+                .push(target.resolve(roots));
+        }
+    }
+    out
 }
 
 /// Everything that needs write access to `/etc` or `/var/lib/rig`.
@@ -658,6 +713,9 @@ fn doctor(root: &Path) -> i32 {
         repo.hosts.len(),
         repo.defaults.len()
     );
+    for line in packages::doctor_lines(Policy::default()) {
+        println!("{line}");
+    }
     i32::from(!warnings.is_empty())
 }
 
@@ -1135,8 +1193,7 @@ fn resolve(
             if target.is_etc() != etc || only.as_ref().is_some_and(|t| *t != target) {
                 continue;
             }
-            // SAFETY-free: geteuid has no preconditions.
-            if etc && !etc_only && unsafe { libc::geteuid() } != 0 {
+            if etc && !etc_only && !is_root() {
                 pending_etc += 1;
                 continue;
             }
