@@ -56,19 +56,28 @@ pub fn names_of(listing: &str, wanted: &BTreeSet<String>) -> BTreeSet<String> {
         .collect()
 }
 
+/// A package manager's "no such package" answer, so `step` can point at `packages.toml`.
+#[derive(Debug)]
+pub struct NotFound(pub String);
+
+impl std::fmt::Display for NotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: not found", self.0)
+    }
+}
+
+impl std::error::Error for NotFound {}
+
 /// The native backend for this OS, then nix and mise everywhere.
 #[must_use]
 pub fn backends_for(os: &Os, casks: BTreeSet<String>) -> Vec<Box<dyn PackageBackend>> {
-    let mut out: Vec<Box<dyn PackageBackend>> = Vec::new();
-    if os.matches("arch") {
-        out.push(Box::new(arch::Arch));
-    } else if os.matches("ubuntu") || os.matches("debian") {
-        out.push(Box::new(apt::Apt));
-    } else if os.matches("macos") {
-        out.push(Box::new(brew::Brew::new(casks)));
-    } else if os.matches("keel") {
-        out.push(Box::new(keel::Keel));
-    }
+    let mut out: Vec<Box<dyn PackageBackend>> = match Backend::native(os) {
+        Some(Backend::Arch) => vec![Box::new(arch::Arch)],
+        Some(Backend::Ubuntu) => vec![Box::new(apt::Apt)],
+        Some(Backend::Macos) => vec![Box::new(brew::Brew::new(casks))],
+        Some(Backend::Keel) => vec![Box::new(keel::Keel)],
+        _ => Vec::new(),
+    };
     out.push(Box::new(nix::Nix));
     out.push(Box::new(mise::Mise));
     out
@@ -82,12 +91,7 @@ pub struct Options {
 }
 
 fn wanted(sel: &Selection, backend: Backend) -> BTreeSet<String> {
-    sel.modules
-        .iter()
-        .filter_map(|m| m.packages.get(&backend))
-        .flatten()
-        .cloned()
-        .collect()
+    sel.packages.get(&backend).cloned().unwrap_or_default()
 }
 
 /// Brings every backend in line with the active modules, recording what rig installed.
@@ -102,6 +106,16 @@ pub fn sync(
     opts: Options,
 ) -> Result<Report> {
     let mut report = Report::default();
+    for name in &sel.absent {
+        report.push(
+            Row::new("package", name)
+                .module(&format!(
+                    "not on {}",
+                    Backend::native(os).map_or("this os".to_string(), |b| b.to_string())
+                ))
+                .quietly(),
+        );
+    }
     let mut backends = backends_for(os, state.macos_casks.clone());
     for backend in &mut backends {
         let kind = backend.kind();
@@ -127,6 +141,13 @@ pub fn sync(
 }
 
 fn error_row(kind: Backend, e: &anyhow::Error) -> Row {
+    if let Some(NotFound(name)) = e.downcast_ref::<NotFound>() {
+        return Row::new("error", &format!("package {name}"))
+            .note(&format!(
+                "not found on {kind} (add [{name}] {kind} = \"...\" to packages.toml)"
+            ))
+            .exit(2);
+    }
     Row::new("error", &format!("packages: {kind}"))
         .note(&format!("{e:#}"))
         .exit(2)

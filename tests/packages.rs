@@ -5,6 +5,7 @@ use common::Sandbox;
 const FAKE: &str = r#"#!/bin/sh
 name=$(basename "$0")
 printf '%s %s\n' "$name" "$*" >> "$FAKE_LOG"
+missing() { grep -qx "$1" "$FAKE_MISSING" 2>/dev/null; }
 case "$name $1" in
   "sudo "*)
     shift
@@ -27,11 +28,17 @@ case "$name $1" in
     for p in "$@"; do grep -vx "$p" "$FAKE_INSTALLED" > "$FAKE_INSTALLED.t"; mv "$FAKE_INSTALLED.t" "$FAKE_INSTALLED"; done ;;
   "yay -S"|"paru -S")
     shift 3
-    for p in "$@"; do echo "$p" >> "$FAKE_INSTALLED"; done ;;
+    for p in "$@"; do
+      missing "$p" && { echo " -> Could not find all required packages: $p" >&2; exit 1; }
+      echo "$p" >> "$FAKE_INSTALLED"
+    done ;;
   "dpkg-query -W") sed 's/$/\tinstalled/' "$FAKE_INSTALLED" ;;
   "apt-get install")
     shift 3
-    for p in "$@"; do echo "$p" >> "$FAKE_INSTALLED"; done ;;
+    for p in "$@"; do
+      missing "$p" && { echo "E: Unable to locate package $p" >&2; exit 100; }
+      echo "$p" >> "$FAKE_INSTALLED"
+    done ;;
   "apt-get remove")
     shift 2
     for p in "$@"; do grep -vx "$p" "$FAKE_INSTALLED" > "$FAKE_INSTALLED.t"; mv "$FAKE_INSTALLED.t" "$FAKE_INSTALLED"; done ;;
@@ -39,7 +46,10 @@ case "$name $1" in
   "brew list") cat "$FAKE_INSTALLED" ;;
   "brew install")
     shift
-    if [ "$1" = "--cask" ]; then shift; echo "$1" >> "$FAKE_INSTALLED"; exit 0; fi
+    prev=$1
+    if [ "$1" = "--cask" ]; then shift; fi
+    missing "$1" && { echo "Error: No formulae or casks found for $1." >&2; exit 1; }
+    if [ "$prev" = "--cask" ]; then echo "$1" >> "$FAKE_INSTALLED"; exit 0; fi
     [ "$1" = "mise" ] && cp "$0" "$(dirname "$0")/mise"
     if grep -qx "$1" "$FAKE_CASKS" 2>/dev/null; then echo "No available formula with the name \"$1\"" >&2; exit 1; fi
     echo "$1" >> "$FAKE_INSTALLED" ;;
@@ -51,7 +61,9 @@ case "$name $1" in
   "nix profile")
     case "$2" in
       list) cat "$FAKE_NIX_JSON" ;;
-      install) shift 2; for p in "$@"; do echo "$p" >> "$FAKE_LOG.nix"; done ;;
+      install) shift 2; for p in "$@"; do
+        missing "$p" && { echo "error: flake 'flake:nixpkgs' does not provide attribute '$p'" >&2; exit 1; }
+        echo "$p" >> "$FAKE_LOG.nix"; done ;;
       remove) [ -n "$FAKE_NIX_UNKNOWN" ] && { echo "error: unknown element" >&2; exit 1; } ;;
     esac ;;
   "nix --version") echo "nix (Nix) 2.24.9" ;;
@@ -81,6 +93,7 @@ fn sandbox(os: &str) -> Sandbox {
     sb.set_repo_packages(&["ghostty", "ripgrep", "vim"]);
     sb.set_nix_json("{\"elements\":{}}");
     sb.set_mise_json("{}");
+    sb.set_missing(&[]);
     sb
 }
 
@@ -549,6 +562,125 @@ mod mise {
         let run = sb.rig(&["doctor", sb.repo.to_str().unwrap()]);
         assert!(run.stdout.contains("mise: not available"), "{}", run.stdout);
         assert!(!run.stderr.contains("mise:"), "{}", run.stderr);
+    }
+}
+
+mod canonical {
+    use super::{sandbox, up};
+
+    const SPELLINGS: &str =
+        "[fd]\nubuntu = \"fd-find\"\n\n[gh]\nmise = \"gh\"\n\n[localsend]\nubuntu = false\n";
+
+    fn setup(os: &str, names: &str) -> super::common::Sandbox {
+        let sb = sandbox(os);
+        sb.write_repo(
+            "modules/tools/module.toml",
+            &format!("packages = [{names}]\n"),
+        );
+        sb.write_repo("packages.toml", SPELLINGS);
+        sb
+    }
+
+    #[test]
+    fn spelling_per_os() {
+        let sb = setup("linux:ubuntu", "\"fd\"");
+        up(&sb, &[]);
+        assert!(
+            sb.log()
+                .join("\n")
+                .contains("apt-get install -y --no-install-recommends fd-find"),
+            "{:?}",
+            sb.log()
+        );
+
+        let sb = setup("linux:arch", "\"fd\"");
+        sb.set_repo_packages(&["fd"]);
+        up(&sb, &[]);
+        assert!(
+            sb.log()
+                .join("\n")
+                .contains("pacman -S --needed --noconfirm fd"),
+            "{:?}",
+            sb.log()
+        );
+    }
+
+    #[test]
+    fn mise_entry_wins_on_every_os() {
+        for os in ["linux:arch", "linux:ubuntu", "macos"] {
+            let sb = setup(os, "\"gh\"");
+            let run = up(&sb, &[]);
+            assert_eq!(run.status, 0, "{}{}", run.stdout, run.stderr);
+            let log = sb.log().join("\n");
+            assert!(log.contains("mise install"), "{os}: {log}");
+            assert!(
+                !log.contains("install gh") && !log.contains("noconfirm gh"),
+                "{os}: {log}"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_is_verbose_only() {
+        let sb = setup("linux:ubuntu", "\"localsend\"");
+        let run = up(&sb, &[]);
+        assert!(!run.stdout.contains("localsend"), "{}", run.stdout);
+        assert!(!sb.log().join("\n").contains("localsend"), "{:?}", sb.log());
+        let run = up(&sb, &["-v"]);
+        assert!(
+            run.stdout.contains("package")
+                && run.stdout.contains("localsend")
+                && run.stdout.contains("(not on ubuntu)"),
+            "{}",
+            run.stdout
+        );
+    }
+
+    #[test]
+    fn unknown_backend_in_spellings_is_a_load_error() {
+        let sb = setup("linux:arch", "\"fd\"");
+        sb.write_repo("packages.toml", "[fd]\nfedora = \"fd\"\n");
+        let run = up(&sb, &[]);
+        assert_eq!(run.status, 2, "{}{}", run.stdout, run.stderr);
+        assert!(
+            run.stderr.contains("packages.toml") && run.stderr.contains("fedora"),
+            "{}",
+            run.stderr
+        );
+    }
+
+    #[test]
+    fn not_found_points_at_spellings() {
+        for (os, name) in [
+            ("linux:ubuntu", "fd"),
+            ("linux:arch", "fd"),
+            ("macos", "fd"),
+        ] {
+            let sb = setup(os, &format!("\"{name}\""));
+            sb.write_repo("packages.toml", "");
+            sb.set_missing(&["fd"]);
+            let run = up(&sb, &[]);
+            assert_eq!(run.status, 2, "{os}: {}{}", run.stdout, run.stderr);
+            let backend = os.rsplit(':').next().unwrap();
+            assert!(run.stdout.contains("package fd"), "{os}: {}", run.stdout);
+            assert!(
+                run.stdout.contains(&format!(
+                    "not found on {backend} (add [fd] {backend} = \"...\" to packages.toml)"
+                )),
+                "{os}: {}",
+                run.stdout
+            );
+            assert!(
+                !run.stdout.contains("Unable to locate"),
+                "{os}: {}",
+                run.stdout
+            );
+        }
+        let sb = setup("linux:arch", "\"fd\"");
+        sb.write_repo("packages.toml", "[fd]\nnix = \"nixpkgs#fd\"\n");
+        sb.set_missing(&["nixpkgs#fd"]);
+        let run = up(&sb, &[]);
+        assert!(run.stdout.contains("not found on nix"), "{}", run.stdout);
     }
 }
 

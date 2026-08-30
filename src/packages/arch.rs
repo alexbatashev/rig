@@ -1,4 +1,4 @@
-use super::{names_of, PackageBackend};
+use super::{names_of, NotFound, PackageBackend};
 use crate::exec::{run, run_capture, try_run, which, Cmd, Policy};
 use crate::repo::Backend;
 use anyhow::{bail, Result};
@@ -59,10 +59,21 @@ impl PackageBackend for Arch {
             let Some(helper) = Arch::aur_helper() else {
                 bail!("no AUR helper (yay or paru) for: {}", aur.join(", "));
             };
-            run(
-                &Cmd::new(helper, &["-S", "--needed", "--noconfirm"]).with(&aur),
-                policy,
-            )?;
+            for name in &aur {
+                let (_, stderr, ok) = try_run(
+                    &Cmd::new(helper, &["-S", "--needed", "--noconfirm", name]),
+                    policy,
+                )?;
+                if ok {
+                    continue;
+                }
+                if stderr.contains("target not found")
+                    || stderr.contains("Could not find all required packages")
+                {
+                    return Err(NotFound(name.clone()).into());
+                }
+                bail!("{helper} -S {name} failed: {}", stderr.trim());
+            }
         }
         Ok(())
     }

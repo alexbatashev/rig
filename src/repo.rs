@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -200,6 +200,22 @@ pub enum Backend {
 }
 
 impl Backend {
+    /// The package manager this OS ships with, if rig drives one.
+    #[must_use]
+    pub fn native(os: &Os) -> Option<Backend> {
+        if os.matches("arch") {
+            Some(Backend::Arch)
+        } else if os.matches("ubuntu") || os.matches("debian") {
+            Some(Backend::Ubuntu)
+        } else if os.matches("macos") {
+            Some(Backend::Macos)
+        } else if os.matches("keel") {
+            Some(Backend::Keel)
+        } else {
+            None
+        }
+    }
+
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -252,12 +268,54 @@ pub struct ModuleFile {
     pub mode: u32,
 }
 
+/// How a canonical package name is spelled for one backend, from `packages.toml`.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(untagged, expecting = "a package name or false")]
+pub enum Spelling {
+    Name(String),
+    Absent(Absent),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "bool")]
+pub struct Absent;
+
+impl TryFrom<bool> for Absent {
+    type Error = &'static str;
+    fn try_from(v: bool) -> std::result::Result<Absent, &'static str> {
+        if v {
+            Err("only false is allowed; drop the key to use the default spelling")
+        } else {
+            Ok(Absent)
+        }
+    }
+}
+
+pub type Spellings = BTreeMap<String, BTreeMap<Backend, Spelling>>;
+
+/// What a module lists under `packages`: one canonical list or a table per backend.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(
+    untagged,
+    expecting = "a list of package names or a table keyed by backend"
+)]
+pub enum Packages {
+    Names(Vec<String>),
+    PerBackend(BTreeMap<Backend, Vec<String>>),
+}
+
+impl Default for Packages {
+    fn default() -> Packages {
+        Packages::PerBackend(BTreeMap::new())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Module {
     pub name: String,
     pub root: PathBuf,
     pub when_os: Option<Vec<String>>,
-    pub packages: BTreeMap<Backend, Vec<String>>,
+    pub packages: Packages,
     pub hooks: Vec<Hook>,
     pub sync: Sync,
     pub files: Vec<ModuleFile>,
@@ -282,6 +340,7 @@ pub struct Repo {
     pub missing_defaults: Vec<PathBuf>,
     pub hosts: BTreeMap<String, Host>,
     pub modules: BTreeMap<String, Module>,
+    pub spellings: Spellings,
 }
 
 #[derive(Deserialize, Default)]
@@ -305,7 +364,7 @@ struct ModuleToml {
     #[serde(default)]
     sync: Sync,
     #[serde(default)]
-    packages: BTreeMap<Backend, Vec<String>>,
+    packages: Packages,
     #[serde(default, rename = "hook")]
     hooks: Vec<Hook>,
 }
@@ -524,6 +583,12 @@ pub fn load(root: &Path) -> Result<Repo> {
     }
 
     let hosts = load_hosts(&root, &modules)?;
+    let spellings_toml = root.join("packages.toml");
+    let spellings = if spellings_toml.exists() {
+        parse_toml(&spellings_toml, &root)?
+    } else {
+        Spellings::new()
+    };
 
     Ok(Repo {
         root,
@@ -531,6 +596,7 @@ pub fn load(root: &Path) -> Result<Repo> {
         missing_defaults,
         hosts,
         modules,
+        spellings,
     })
 }
 
@@ -539,6 +605,10 @@ pub fn load(root: &Path) -> Result<Repo> {
 pub struct Selection<'a> {
     pub host: String,
     pub modules: Vec<&'a Module>,
+    /// Every package the modules want on this OS, in each backend's own spelling.
+    pub packages: BTreeMap<Backend, BTreeSet<String>>,
+    /// Canonical names `packages.toml` marks as not wanted on this OS.
+    pub absent: BTreeSet<String>,
 }
 
 impl Selection<'_> {
@@ -548,10 +618,41 @@ impl Selection<'_> {
     }
 }
 
-/// Picks the modules a host runs on this OS.
+/// Where canonical name `name` installs on an OS whose native backend is `native`:
+/// the native spelling if given, else mise, else nix, else the name itself natively.
 ///
 /// # Errors
-/// When the host is not in the repo.
+/// When nothing applies, which needs an OS without a native backend.
+fn resolve(
+    name: &str,
+    entry: Option<&BTreeMap<Backend, Spelling>>,
+    native: Option<Backend>,
+) -> Result<Option<(Backend, String)>> {
+    let get = |b| entry.and_then(|e| e.get(&b));
+    if let Some(x) = native {
+        match get(x) {
+            Some(Spelling::Name(n)) => return Ok(Some((x, n.clone()))),
+            Some(Spelling::Absent(_)) => return Ok(None),
+            None => {}
+        }
+    }
+    for b in [Backend::Mise, Backend::Nix] {
+        if let Some(Spelling::Name(n)) = get(b) {
+            return Ok(Some((b, n.clone())));
+        }
+    }
+    match native {
+        Some(x) => Ok(Some((x, name.to_string()))),
+        None => bail!(
+            "package {name}: no backend on this OS (add [{name}] mise or nix to packages.toml)"
+        ),
+    }
+}
+
+/// Picks the modules a host runs on this OS and resolves their package lists.
+///
+/// # Errors
+/// When the host is not in the repo or a package has no backend on this OS.
 ///
 /// # Panics
 /// Never; `load` rejects hosts that name a module the repo lacks.
@@ -560,7 +661,7 @@ pub fn select<'a>(repo: &'a Repo, host: &str, os: &Os) -> Result<Selection<'a>> 
         let known: Vec<&str> = repo.hosts.keys().map(String::as_str).collect();
         bail!("unknown host '{host}'; repo has: {}", known.join(", "));
     };
-    let modules = h
+    let modules: Vec<&Module> = h
         .modules
         .iter()
         .map(|n| &repo.modules[n])
@@ -570,9 +671,38 @@ pub fn select<'a>(repo: &'a Repo, host: &str, os: &Os) -> Result<Selection<'a>> 
                 .is_none_or(|tags| tags.iter().any(|t| os.matches(t)))
         })
         .collect();
+    let native = Backend::native(os);
+    let mut packages: BTreeMap<Backend, BTreeSet<String>> = BTreeMap::new();
+    let mut absent = BTreeSet::new();
+    for m in modules.iter().copied() {
+        match &m.packages {
+            Packages::PerBackend(map) => {
+                for (b, names) in map {
+                    packages
+                        .entry(*b)
+                        .or_default()
+                        .extend(names.iter().cloned());
+                }
+            }
+            Packages::Names(names) => {
+                for n in names {
+                    match resolve(n, repo.spellings.get(n.as_str()), native)? {
+                        Some((b, spelled)) => {
+                            packages.entry(b).or_default().insert(spelled);
+                        }
+                        None => {
+                            absent.insert(n.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
     Ok(Selection {
         host: host.to_string(),
         modules,
+        packages,
+        absent,
     })
 }
 
@@ -794,5 +924,77 @@ mod tests {
             .map(|d| d.target.to_string())
             .collect();
         assert_eq!(targets, vec!["~/f.lua"]);
+    }
+
+    fn spell(toml: &str) -> BTreeMap<Backend, Spelling> {
+        toml::from_str(toml).unwrap()
+    }
+
+    #[test]
+    fn resolve_rules() {
+        let ubuntu = Some(Backend::Ubuntu);
+        let r = |entry: &str, native| resolve("fd", Some(&spell(entry)), native).unwrap();
+        assert_eq!(
+            r("ubuntu = \"fd-find\"", ubuntu),
+            Some((Backend::Ubuntu, "fd-find".into()))
+        );
+        assert_eq!(r("ubuntu = false", ubuntu), None);
+        assert_eq!(
+            r("mise = \"fd\"\nnix = \"nixpkgs#fd\"", ubuntu),
+            Some((Backend::Mise, "fd".into()))
+        );
+        assert_eq!(
+            r("nix = \"nixpkgs#fd\"", ubuntu),
+            Some((Backend::Nix, "nixpkgs#fd".into()))
+        );
+        assert_eq!(
+            r("arch = \"fd\"", ubuntu),
+            Some((Backend::Ubuntu, "fd".into()))
+        );
+        assert_eq!(
+            resolve("fd", None, ubuntu).unwrap(),
+            Some((Backend::Ubuntu, "fd".into()))
+        );
+        assert!(resolve("fd", None, None).is_err());
+    }
+
+    #[test]
+    fn spelling_rejects_true_and_unknown_backends() {
+        let bad: std::result::Result<Spellings, _> = toml::from_str("[fd]\nfedora = \"fd\"");
+        assert!(bad.unwrap_err().to_string().contains("fedora"));
+        let bad: std::result::Result<Spellings, _> = toml::from_str("[fd]\nubuntu = true");
+        assert!(bad.is_err());
+    }
+
+    #[test]
+    fn selection_resolves_canonical_and_per_backend_lists() {
+        let (_d, repo) = load_build(&one_module(&[
+            (
+                "modules/m/module.toml",
+                "packages = [\"fd\", \"gh\", \"localsend\"]\n",
+            ),
+            (
+                "modules/n/module.toml",
+                "[packages]\nubuntu = [\"nvidia\"]\n",
+            ),
+            ("hosts/box.toml", "modules = [\"m\", \"n\"]\n"),
+            (
+                "packages.toml",
+                "[fd]\nubuntu = \"fd-find\"\n[gh]\nmise = \"gh\"\n[localsend]\nubuntu = false\n",
+            ),
+        ]));
+        let sel = select(&repo, "box", &Os::parse("linux:ubuntu")).unwrap();
+        assert_eq!(
+            sel.packages[&Backend::Ubuntu],
+            ["fd-find".to_string(), "nvidia".to_string()].into()
+        );
+        assert_eq!(sel.packages[&Backend::Mise], ["gh".to_string()].into());
+        assert_eq!(sel.absent, ["localsend".to_string()].into());
+        let sel = select(&repo, "box", &Os::parse("linux:arch")).unwrap();
+        assert_eq!(
+            sel.packages[&Backend::Arch],
+            ["fd".to_string(), "localsend".to_string()].into()
+        );
+        assert!(sel.absent.is_empty());
     }
 }

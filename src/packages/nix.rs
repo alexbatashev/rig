@@ -1,4 +1,4 @@
-use super::PackageBackend;
+use super::{NotFound, PackageBackend};
 use crate::exec::{run, run_capture, try_run, which, Cmd, Policy};
 use crate::repo::Backend;
 use anyhow::Result;
@@ -65,10 +65,16 @@ impl PackageBackend for Nix {
     }
 
     fn install(&mut self, names: &[String], policy: Policy) -> Result<()> {
-        run(
-            &Cmd::new("nix", &["profile", "install"]).with(names),
-            policy,
-        )?;
+        for name in names {
+            let (_, stderr, ok) = try_run(&Cmd::new("nix", &["profile", "install", name]), policy)?;
+            if ok {
+                continue;
+            }
+            if stderr.contains("does not provide attribute") {
+                return Err(NotFound(name.clone()).into());
+            }
+            anyhow::bail!("nix profile install {name} failed: {}", stderr.trim());
+        }
         Ok(())
     }
 

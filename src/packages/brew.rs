@@ -1,4 +1,4 @@
-use super::{names_of, PackageBackend};
+use super::{names_of, NotFound, PackageBackend};
 use crate::exec::{run, run_capture, try_run, which, Cmd, Policy};
 use crate::repo::Backend;
 use anyhow::Result;
@@ -53,7 +53,13 @@ impl PackageBackend for Brew {
             if !missing_formula(&stderr) {
                 anyhow::bail!("brew install {name} failed: {}", stderr.trim());
             }
-            run(&Cmd::new("brew", &["install", "--cask", name]), policy)?;
+            let (_, stderr, ok) = try_run(&Cmd::new("brew", &["install", "--cask", name]), policy)?;
+            if !ok {
+                if missing_formula(&stderr) {
+                    return Err(NotFound(name.clone()).into());
+                }
+                anyhow::bail!("brew install --cask {name} failed: {}", stderr.trim());
+            }
             self.casks.insert(name.clone());
         }
         Ok(())

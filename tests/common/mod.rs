@@ -178,6 +178,11 @@ impl Sandbox {
         self.write_list("fake.repo", names);
     }
 
+    /// Names every fake package manager answers "not found" for.
+    pub fn set_missing(&self, names: &[&str]) {
+        self.write_list("fake.missing", names);
+    }
+
     /// Names the fake `brew install` rejects as a formula.
     pub fn set_casks(&self, names: &[&str]) {
         self.write_list("fake.casks", names);
@@ -219,6 +224,7 @@ impl Sandbox {
             .env("FAKE_INSTALLED", self.root.path().join("fake.installed"))
             .env("FAKE_REPO", self.root.path().join("fake.repo"))
             .env("FAKE_CASKS", self.root.path().join("fake.casks"))
+            .env("FAKE_MISSING", self.root.path().join("fake.missing"))
             .env("FAKE_NIX_JSON", self.root.path().join("fake.nix.json"))
             .env("FAKE_MISE_JSON", self.root.path().join("fake.mise.json"))
             .envs(self.env.clone())

@@ -1,5 +1,5 @@
-use super::{names_of, PackageBackend};
-use crate::exec::{run, run_capture, which, Cmd, Policy};
+use super::{names_of, NotFound, PackageBackend};
+use crate::exec::{run, run_capture, try_run, which, Cmd, Policy};
 use crate::repo::Backend;
 use anyhow::Result;
 use std::collections::BTreeSet;
@@ -40,13 +40,24 @@ impl PackageBackend for Apt {
     }
 
     fn install(&mut self, names: &[String], policy: Policy) -> Result<()> {
-        run(
-            &Cmd::new("apt-get", &["install", "-y", "--no-install-recommends"])
-                .with(names)
+        for name in names {
+            let (_, stderr, ok) = try_run(
+                &Cmd::new(
+                    "apt-get",
+                    &["install", "-y", "--no-install-recommends", name],
+                )
                 .env("DEBIAN_FRONTEND", "noninteractive")
                 .as_root(),
-            policy,
-        )?;
+                policy,
+            )?;
+            if ok {
+                continue;
+            }
+            if stderr.contains("Unable to locate package") {
+                return Err(NotFound(name.clone()).into());
+            }
+            anyhow::bail!("apt-get install {name} failed: {}", stderr.trim());
+        }
         Ok(())
     }
 
