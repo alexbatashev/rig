@@ -9,4 +9,5 @@ pub mod packages;
 pub mod reconcile;
 pub mod repo;
 pub mod report;
+pub mod settings;
 pub mod state;

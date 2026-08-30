@@ -316,10 +316,14 @@ pub struct Module {
     pub root: PathBuf,
     pub when_os: Option<Vec<String>>,
     pub packages: Packages,
+    /// Declared settings by provider, then domain, then key.
+    pub settings: BTreeMap<String, Settings>,
     pub hooks: Vec<Hook>,
     pub sync: Sync,
     pub files: Vec<ModuleFile>,
 }
+
+pub type Settings = BTreeMap<String, BTreeMap<String, toml::Value>>;
 
 #[derive(Clone, Debug)]
 pub struct Host {
@@ -365,6 +369,8 @@ struct ModuleToml {
     sync: Sync,
     #[serde(default)]
     packages: Packages,
+    #[serde(default)]
+    defaults: Settings,
     #[serde(default, rename = "hook")]
     hooks: Vec<Hook>,
 }
@@ -563,6 +569,20 @@ pub fn load(root: &Path) -> Result<Repo> {
             } else {
                 ModuleToml::default()
             };
+            for (domain, keys) in &cfg.defaults {
+                for (key, value) in keys {
+                    if matches!(value, toml::Value::Array(_) | toml::Value::Table(_)) {
+                        bail!(
+                            "modules/{name}/module.toml: defaults.{domain}.{key} must be a scalar"
+                        );
+                    }
+                }
+            }
+            let settings = if cfg.defaults.is_empty() {
+                BTreeMap::new()
+            } else {
+                BTreeMap::from([("macos".to_string(), cfg.defaults)])
+            };
             let empty = std::fs::read_dir(&dir)?.next().is_none();
             if !empty && !has_toml && !dir.join("home").is_dir() && !dir.join("etc").is_dir() {
                 bail!("modules/{name}: no home/, no etc/ and no module.toml");
@@ -574,6 +594,7 @@ pub fn load(root: &Path) -> Result<Repo> {
                     root: dir.clone(),
                     when_os: cfg.when.and_then(|w| w.os),
                     packages: cfg.packages,
+                    settings,
                     hooks: cfg.hooks,
                     sync: cfg.sync,
                     files: load_tree(&dir, &root)?,

@@ -59,6 +59,8 @@ pub struct State {
     pub entries: BTreeMap<Target, Entry>,
     pub packages: BTreeMap<Backend, BTreeSet<String>>,
     pub macos_casks: BTreeSet<String>,
+    /// `provider:domain.key` to the value rig last wrote or adopted.
+    pub settings: BTreeMap<String, String>,
 }
 
 /// Reads content that `reconcile` needs as the diff3 ancestor.
@@ -90,6 +92,8 @@ struct Manifest {
     packages: BTreeMap<Backend, BTreeSet<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     packages_meta: Option<MetaToml>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    settings: BTreeMap<String, String>,
 }
 
 pub struct Store {
@@ -167,6 +171,7 @@ impl Store {
             entries,
             packages: m.packages,
             macos_casks: m.packages_meta.unwrap_or_default().macos_casks,
+            settings: m.settings,
         };
         Ok((store, state))
     }
@@ -198,6 +203,7 @@ impl Store {
                 })
                 .collect(),
             packages: state.packages.clone(),
+            settings: state.settings.clone(),
             packages_meta: (!state.macos_casks.is_empty()).then(|| MetaToml {
                 macos_casks: state.macos_casks.clone(),
             }),

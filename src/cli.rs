@@ -9,6 +9,7 @@ use crate::packages;
 use crate::reconcile::{reconcile, Action, Disk, Force, Options, Outcome, Plan};
 use crate::repo::{load, select, Os, Repo, Roots, Selection, Sync, Target, KNOWN_OS_TAGS};
 use crate::report::{Report, Row};
+use crate::settings;
 use crate::state::{write_atomic, BlobSource, Entry, Hash, State, Store};
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -460,12 +461,42 @@ fn up(args: &UpArgs, roots: &Roots, etc_root: Option<&Path>) -> Result<i32> {
         }
     }
 
+    sync_machine(args, &session, &opts, roots, &mut report)?;
+    print_report(&report, args.verbose)?;
+    Ok(exit.max(report.exit()))
+}
+
+/// Settings, packages and hooks: everything after the files are on disk.
+fn sync_machine(
+    args: &UpArgs,
+    session: &Session,
+    opts: &Options,
+    roots: &Roots,
+    report: &mut Report,
+) -> Result<()> {
     let policy = Policy {
         no_sudo: args.no_sudo,
         verbose: args.verbose,
     };
     let sel = session.selection()?;
     let (home_store, mut home_state) = Store::open(&home_state_dir()?)?;
+    let settings_before = home_state.settings.clone();
+    let settings = settings::sync(
+        &settings::providers(),
+        &sel,
+        &mut home_state,
+        settings::Options {
+            policy,
+            dry_run: args.dry_run,
+            force: matches!(opts.force, Force::All),
+        },
+    )?;
+    if home_state.settings != settings_before {
+        home_store.save(&home_state)?;
+    }
+    for row in settings.rows {
+        report.push(row);
+    }
     let packages = packages::sync(
         &sel,
         &session.os,
@@ -477,7 +508,7 @@ fn up(args: &UpArgs, roots: &Roots, etc_root: Option<&Path>) -> Result<i32> {
             dry_run: args.dry_run,
         },
     )?;
-    let written = written_by_module(&report, roots);
+    let written = written_by_module(report, roots);
     let visible = report.rows.iter().chain(&packages.rows).any(|r| !r.quiet);
     let runs = run_hooks(&sel, &written, &roots.home, args.dry_run);
     for row in packages.rows {
@@ -486,8 +517,7 @@ fn up(args: &UpArgs, roots: &Roots, etc_root: Option<&Path>) -> Result<i32> {
     for row in hooks::rows(&runs, visible, args.verbose) {
         report.push(row);
     }
-    print_report(&report, args.verbose)?;
-    Ok(exit.max(report.exit()))
+    Ok(())
 }
 
 /// The absolute paths `up` wrote, grouped by owning module, for `RIG_CHANGED`.
@@ -612,6 +642,16 @@ fn status(roots: &Roots, host: Option<&str>, verbose: bool) -> Result<i32> {
         }
     }
     report.rows.sort_by(|a, b| a.target.cmp(&b.target));
+    let (_, state) = Store::open(&home_state_dir()?)?;
+    let settings = settings::status(
+        &settings::providers(),
+        &session.selection()?,
+        &state,
+        Policy::default(),
+    )?;
+    for row in settings.rows {
+        report.push(row);
+    }
     print_report(&report, verbose)?;
     Ok(report.exit())
 }
@@ -685,6 +725,29 @@ fn diff(roots: &Roots, path: Option<&str>, host: Option<&str>) -> Result<i32> {
             exit = 1;
             println!("{}", p.target);
             std::io::stdout().write_all(&body)?;
+        }
+    }
+    if only.is_none() {
+        let (_, state) = Store::open(&home_state_dir()?)?;
+        let (items, _) = settings::plan(
+            &settings::providers(),
+            &session.selection()?,
+            &state,
+            Policy::default(),
+        )?;
+        for item in items {
+            if !matches!(
+                item.outcome,
+                settings::Outcome::Ok | settings::Outcome::Adopted
+            ) {
+                exit = 1;
+                println!(
+                    "{}: {} -> {}",
+                    item.label(),
+                    item.machine.as_deref().unwrap_or("unset"),
+                    item.desired
+                );
+            }
         }
     }
     Ok(exit)
