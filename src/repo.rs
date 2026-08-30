@@ -504,7 +504,8 @@ pub fn load(root: &Path) -> Result<Repo> {
             } else {
                 ModuleToml::default()
             };
-            if !has_toml && !dir.join("home").is_dir() && !dir.join("etc").is_dir() {
+            let empty = std::fs::read_dir(&dir)?.next().is_none();
+            if !empty && !has_toml && !dir.join("home").is_dir() && !dir.join("etc").is_dir() {
                 bail!("modules/{name}: no home/, no etc/ and no module.toml");
             }
             modules.insert(
@@ -700,6 +701,13 @@ mod tests {
     fn module_with_nothing_in_it_is_an_error() {
         let dir = build(&[("modules/m/README", "x\n")]);
         assert!(load(dir.path()).is_err());
+    }
+
+    #[test]
+    fn an_empty_module_directory_is_valid() {
+        let dir = build(&[("hosts/desktop.toml", "modules = []\n")]);
+        std::fs::create_dir_all(dir.path().join("modules/m")).unwrap();
+        assert!(load(dir.path()).unwrap().modules.contains_key("m"));
     }
 
     #[test]

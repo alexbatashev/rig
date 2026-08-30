@@ -250,10 +250,12 @@ fn set_in_section(s: &mut Section, key: &str, values: &[String]) {
     let indent = pos
         .first()
         .map_or_else(String::new, |i| indent_of(s.lines[*i].raw()).to_string());
+    // Replacing in place keeps the key where the reader expects it.
+    let at = pos.first().copied();
     for i in pos.into_iter().rev() {
         s.lines.remove(i);
     }
-    let at = append_at(s);
+    let at = at.unwrap_or_else(|| append_at(s));
     let new: Vec<Line> = values
         .iter()
         .map(|v| Line::Entry {

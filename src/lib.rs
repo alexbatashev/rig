@@ -1,3 +1,4 @@
+pub mod absorb;
 pub mod apply;
 pub mod cli;
 pub mod compose;

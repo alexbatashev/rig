@@ -1,15 +1,17 @@
 //! Command line entry points.
 
+use crate::absorb::{absorb, equivalent, summary, AbsorbEdit, Lower, TopLayer};
 use crate::apply::{apply, dry_row, RealDisk};
-use crate::compose::{desired, Desired};
+use crate::compose::{compose, desired, layers, Desired, Layer};
 use crate::reconcile::{reconcile, Action, Disk, Force, Options, Outcome, Plan};
-use crate::repo::{load, select, Os, Repo, Roots, Target, KNOWN_OS_TAGS};
+use crate::repo::{load, select, Os, Repo, Roots, Selection, Sync, Target, KNOWN_OS_TAGS};
 use crate::report::{Report, Row};
-use crate::state::{State, Store};
+use crate::state::{write_atomic, BlobSource, Entry, Hash, State, Store};
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -76,6 +78,47 @@ enum Command {
         #[arg(long)]
         host: Option<String>,
     },
+    /// Carry an edit made on disk back into the repo.
+    Absorb {
+        path: Option<String>,
+        /// Every edited file whose module syncs automatically.
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(short = 'v', long)]
+        verbose: bool,
+    },
+    /// Start managing a file that is already on disk.
+    Adopt {
+        path: String,
+        #[arg(long)]
+        module: String,
+        /// Land it in an `@<host>` variant.
+        #[arg(long)]
+        host_variant: bool,
+        /// Land it in an `@<os>` variant.
+        #[arg(long = "os")]
+        os_variant: bool,
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Open each conflict in $EDITOR and take the result.
+    Resolve {
+        path: Option<String>,
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long, hide = true)]
+        etc_only: bool,
+        #[arg(long, hide = true)]
+        repo: Option<PathBuf>,
+    },
+    /// Create a repo skeleton and register this host.
+    Init {
+        dir: Option<PathBuf>,
+        #[arg(long)]
+        host: Option<String>,
+    },
     /// Report repo parse errors and suspicious variant tags.
     Doctor { repo: Option<PathBuf> },
     /// Print the composed content of every managed target.
@@ -104,6 +147,40 @@ pub fn run(cli: Cli) -> Result<i32> {
         Command::Up(args) => up(&args, &roots, cli.etc_root.as_deref()),
         Command::Status { host, verbose } => status(&roots, host.as_deref(), verbose),
         Command::Diff { path, host } => diff(&roots, path.as_deref(), host.as_deref()),
+        Command::Absorb {
+            path,
+            all,
+            host,
+            verbose,
+        } => absorb_cmd(&roots, path.as_deref(), all, host.as_deref(), verbose),
+        Command::Adopt {
+            path,
+            module,
+            host_variant,
+            os_variant,
+            host,
+        } => adopt(
+            &roots,
+            &path,
+            &module,
+            host_variant,
+            os_variant,
+            host.as_deref(),
+        ),
+        Command::Resolve {
+            path,
+            host,
+            etc_only,
+            repo,
+        } => resolve(
+            &roots,
+            path.as_deref(),
+            host.as_deref(),
+            etc_only,
+            repo.as_deref(),
+            cli.etc_root.as_deref(),
+        ),
+        Command::Init { dir, host } => init(dir.as_deref(), host.as_deref()),
         Command::Doctor { repo } => {
             let path = match repo {
                 Some(p) => p,
@@ -208,9 +285,23 @@ struct Session {
 }
 
 impl Session {
+    fn selection(&self) -> Result<Selection<'_>> {
+        select(&self.repo, &self.host, &self.os)
+    }
+
     fn desired(&self) -> Result<Vec<Desired>> {
-        let sel = select(&self.repo, &self.host, &self.os)?;
-        desired(&self.repo, &sel, &self.os)
+        desired(&self.repo, &self.selection()?, &self.os)
+    }
+
+    fn layers(&self) -> Result<BTreeMap<Target, Vec<Layer>>> {
+        layers(&self.repo, &self.selection()?, &self.os)
+    }
+
+    fn rel(&self, path: &Path) -> String {
+        path.strip_prefix(&self.repo.root)
+            .unwrap_or(path)
+            .display()
+            .to_string()
     }
 }
 
@@ -251,6 +342,12 @@ fn resolve_target(path: &str, roots: &Roots) -> Result<Target> {
             std::env::current_dir()?.join(p)
         }
     };
+    // /etc/... is the display form of an Etc target even when --etc-root remaps it.
+    if let Ok(rel) = expanded.strip_prefix("/etc") {
+        if roots.etc != Path::new("/etc") {
+            return Ok(Target::Etc(rel.to_path_buf()));
+        }
+    }
     let expanded = canonical(&expanded);
     if let Ok(rel) = expanded.strip_prefix(canonical(&roots.home)) {
         return Ok(Target::Home(rel.to_path_buf()));
@@ -314,10 +411,12 @@ fn up(args: &UpArgs, roots: &Roots, etc_root: Option<&Path>) -> Result<i32> {
     }
 
     if args.etc_only {
-        return apply_phase(&items, roots, &etc_state_dir(etc_root), true, args);
+        let report = apply_phase(&items, roots, &etc_state_dir(etc_root), true, args)?;
+        print_report(&report, args.verbose)?;
+        return Ok(report.exit());
     }
 
-    let mut exit = apply_phase(&items, roots, &home_state_dir()?, false, args)?;
+    let mut report = apply_phase(&items, roots, &home_state_dir()?, false, args)?;
 
     let (etc_store, etc_state) = Store::open(&etc_state_dir(etc_root))?;
     let etc: Vec<Plan> = plan_for(&items, roots, &etc_store, &etc_state, &opts)?
@@ -327,25 +426,20 @@ fn up(args: &UpArgs, roots: &Roots, etc_root: Option<&Path>) -> Result<i32> {
     let (actionable, informational): (Vec<Plan>, Vec<Plan>) =
         etc.into_iter().partition(changes_disk_or_state);
 
-    // Rows rig can report without root are printed by the parent, whatever happens next.
-    let mut noted = Report::default();
+    // Rows rig can report without root belong in the parent's own summary.
     for p in &informational {
-        noted.push(Row::from_plan(p));
-    }
-    if !noted.rows.is_empty() {
-        print_report(&noted, args.verbose)?;
-        exit = exit.max(noted.exit());
-    }
-    if actionable.is_empty() {
-        return Ok(exit);
+        report.push(Row::from_plan(p));
     }
     if args.dry_run {
-        let mut r = Report::default();
         for p in &actionable {
-            r.push(dry_row(p));
+            report.push(dry_row(p));
         }
-        print_report(&r, args.verbose)?;
-        return Ok(exit.max(r.exit()));
+    }
+    print_report(&report, args.verbose)?;
+    let exit = report.exit();
+
+    if actionable.is_empty() || args.dry_run {
+        return Ok(exit);
     }
     // SAFETY-free: geteuid has no preconditions.
     if unsafe { libc::geteuid() } == 0 {
@@ -368,7 +462,7 @@ fn apply_phase(
     state_dir: &Path,
     etc: bool,
     args: &UpArgs,
-) -> Result<i32> {
+) -> Result<Report> {
     let opts = Options {
         force: force_from(args, roots)?,
         adopt: args.adopt,
@@ -379,9 +473,7 @@ fn apply_phase(
         .into_iter()
         .filter(|p| p.target.is_etc() == etc)
         .collect();
-    let report = apply(&plans, roots, &store, &mut state, args.dry_run)?;
-    print_report(&report, args.verbose)?;
-    Ok(report.exit())
+    apply(&plans, roots, &store, &mut state, args.dry_run)
 }
 
 fn escalate(
@@ -467,6 +559,15 @@ fn status(roots: &Roots, host: Option<&str>, verbose: bool) -> Result<i32> {
     report.rows.sort_by(|a, b| a.target.cmp(&b.target));
     print_report(&report, verbose)?;
     Ok(report.exit())
+}
+
+/// The state directory that owns this target.
+fn state_dir_for(target: &Target, roots: &Roots) -> Result<PathBuf> {
+    Ok(if target.is_etc() {
+        etc_state_dir(roots_etc_root(roots).as_deref())
+    } else {
+        home_state_dir()?
+    })
 }
 
 /// The home and etc state directories, each paired with the target kind it owns.
@@ -632,4 +733,525 @@ fn write_tree(items: &[Desired], dir: &Path) -> Result<()> {
         std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(d.mode))?;
     }
     Ok(())
+}
+
+// Absorb.
+
+/// What rig last wrote and what is on disk now.
+struct Sides {
+    base: Vec<u8>,
+    disk: Vec<u8>,
+}
+
+fn sides(
+    target: &Target,
+    desired: &Desired,
+    store: &Store,
+    state: &State,
+    disk: &RealDisk,
+) -> Result<Sides> {
+    let Some(entry) = state.entries.get(target) else {
+        bail!("not managed: use rig adopt {target} --module <m>");
+    };
+    let Some(on_disk) = disk.read(target)? else {
+        bail!("file is missing on disk: {target}");
+    };
+    let base = store
+        .blob(&entry.hash)?
+        .with_context(|| format!("state blob missing for {target}; run rig up --force {target}"))?;
+    let k = Hash::of(&on_disk);
+    let d = Hash::of(&desired.content);
+    if k == entry.hash {
+        if d == entry.hash {
+            bail!("nothing to absorb: {target} is unchanged");
+        }
+        bail!("repo changed too: run rig up first, then absorb");
+    }
+    if d != entry.hash {
+        if store.conflicts()?.contains(target) {
+            bail!("conflict: run rig resolve first");
+        }
+        bail!("repo changed too: run rig up first, then absorb");
+    }
+    Ok(Sides {
+        base,
+        disk: on_disk,
+    })
+}
+
+fn top_layer(target: &Target, ls: &[Layer]) -> Result<(TopLayer, usize)> {
+    let idx = ls
+        .iter()
+        .rposition(|l| l.source.module().is_some())
+        .with_context(|| format!("{target} has no module layer"))?;
+    let file = ls[idx].source.path().to_path_buf();
+    let append = ls[idx].append;
+    let lower = if idx == 0 {
+        None
+    } else {
+        Some(Lower {
+            file: ls[idx - 1].source.path().to_path_buf(),
+            content: compose(target, &ls[..idx])?.content,
+        })
+    };
+    Ok((
+        TopLayer {
+            file,
+            content: ls[idx].content.clone(),
+            append,
+            lower,
+        },
+        idx,
+    ))
+}
+
+/// Rewrites the layer file, then checks that composing again reproduces the disk.
+///
+/// Returns the edit and whether the disk had to be rewritten in the layer's formatting.
+fn absorb_one(
+    target: &Target,
+    desired: &Desired,
+    all_layers: &BTreeMap<Target, Vec<Layer>>,
+    store: &Store,
+    state: &mut State,
+    roots: &Roots,
+) -> Result<(AbsorbEdit, bool)> {
+    let disk = RealDisk {
+        roots: roots.clone(),
+    };
+    let s = sides(target, desired, store, state, &disk)?;
+    let ls = &all_layers[target];
+    let (top, idx) = top_layer(target, ls)?;
+    let previous = top.content.clone();
+    let edit = absorb(desired.format, &top, &s.base, &s.disk)?;
+
+    write_atomic(&edit.layer_file, &edit.new_content, ls[idx].mode)?;
+    let mut updated = ls.clone();
+    updated[idx].content.clone_from(&edit.new_content);
+    let recomposed = compose(target, &updated)?;
+
+    if recomposed.content == s.disk {
+        record_absorbed(target, desired, &recomposed.content, store, state)?;
+        return Ok((edit, false));
+    }
+    if equivalent(desired.format, &recomposed.content, &s.disk) {
+        write_atomic(&target.resolve(roots), &recomposed.content, desired.mode)?;
+        record_absorbed(target, desired, &recomposed.content, store, state)?;
+        return Ok((edit, true));
+    }
+    write_atomic(&edit.layer_file, &previous, ls[idx].mode)?;
+    let base = store
+        .root()
+        .join("absorb-failed")
+        .join(target.module_path());
+    let dump = |suffix: &str| {
+        let mut name = base.file_name().unwrap().to_os_string();
+        name.push(suffix);
+        base.with_file_name(name)
+    };
+    write_atomic(&dump(".intended"), &s.disk, 0o644)?;
+    write_atomic(&dump(".actual"), &recomposed.content, 0o644)?;
+    bail!(
+        "absorb did not round trip for {target}; see {} and {}",
+        dump(".intended").display(),
+        dump(".actual").display()
+    )
+}
+
+fn record_absorbed(
+    target: &Target,
+    desired: &Desired,
+    content: &[u8],
+    store: &Store,
+    state: &mut State,
+) -> Result<()> {
+    let hash = store.put_blob(content)?;
+    state.entries.insert(
+        target.clone(),
+        Entry {
+            hash,
+            module: desired.module.clone(),
+            mode: desired.mode,
+        },
+    );
+    store.save(state)
+}
+
+fn absorb_line(
+    session: &Session,
+    module: &str,
+    edit: &AbsorbEdit,
+    normalized: bool,
+    verbose: bool,
+) -> String {
+    let root = session.repo.root.join("modules").join(module);
+    let rel = edit.layer_file.strip_prefix(&root).map_or_else(
+        |_| session.rel(&edit.layer_file),
+        |p| p.display().to_string(),
+    );
+    let mut line = format!("  {module}: {rel}  {}", summary(&edit.changes));
+    if normalized {
+        line.push_str("  normalized");
+    }
+    if verbose && edit.changes.len() > 4 {
+        for c in &edit.changes {
+            use std::fmt::Write as _;
+            let _ = write!(line, "\n    {}", c.render());
+        }
+    }
+    line
+}
+
+fn absorb_cmd(
+    roots: &Roots,
+    path: Option<&str>,
+    all: bool,
+    host: Option<&str>,
+    verbose: bool,
+) -> Result<i32> {
+    let session = open(None, host, false)?;
+    let items = session.desired()?;
+    let all_layers = session.layers()?;
+    let sel = session.selection()?;
+    let mut stores: Vec<(bool, Store, State)> = Vec::new();
+    for (dir, etc) in state_dirs(roots)? {
+        let (store, state) = Store::open(&dir)?;
+        stores.push((etc, store, state));
+    }
+
+    let chosen: Vec<&Desired> = if all {
+        let mut out = Vec::new();
+        for (etc, store, state) in &stores {
+            out.extend(
+                edited_targets(&items, store, state, roots)?
+                    .into_iter()
+                    .filter(|d| d.target.is_etc() == *etc),
+            );
+        }
+        out
+    } else {
+        let p = path.context("rig absorb needs a path or --all")?;
+        let target = resolve_target(p, roots)?;
+        vec![items
+            .iter()
+            .find(|d| d.target == target)
+            .with_context(|| format!("not managed: {p}; use rig adopt {p} --module <m>"))?]
+    };
+
+    let mut report = Report::default();
+    for d in chosen {
+        if all && sel.module(&d.module).map(|m| m.sync) == Some(Sync::Manual) {
+            report.push(
+                Row::new("skipped", &d.target.to_string())
+                    .note("module is sync = manual")
+                    .exit(1),
+            );
+            continue;
+        }
+        let (_, store, state) = stores
+            .iter_mut()
+            .find(|(etc, _, _)| *etc == d.target.is_etc())
+            .context("no state store for this target")?;
+        match absorb_one(&d.target, d, &all_layers, store, state, roots) {
+            Ok((edit, normalized)) => {
+                println!(
+                    "{}",
+                    absorb_line(&session, &d.module, &edit, normalized, verbose)
+                );
+            }
+            Err(e) if all => {
+                report.push(
+                    Row::new("error", &d.target.to_string())
+                        .note(&format!("{e:#}"))
+                        .exit(1),
+                );
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    if !report.rows.is_empty() {
+        print_report(&report, verbose)?;
+    }
+    Ok(report.exit())
+}
+
+/// Targets in cell 7: the disk moved, the repo did not.
+fn edited_targets<'a>(
+    items: &'a [Desired],
+    store: &Store,
+    state: &State,
+    roots: &Roots,
+) -> Result<Vec<&'a Desired>> {
+    let disk = RealDisk {
+        roots: roots.clone(),
+    };
+    let plans = reconcile(items, state, &disk, store, &Options::default())?;
+    Ok(plans
+        .iter()
+        .filter(|p| p.outcome == Outcome::Edited)
+        .filter_map(|p| items.iter().find(|d| d.target == p.target))
+        .collect())
+}
+
+// Adopt.
+
+fn adopt(
+    roots: &Roots,
+    path: &str,
+    module: &str,
+    host_variant: bool,
+    os_variant: bool,
+    host: Option<&str>,
+) -> Result<i32> {
+    let session = open(None, host, false)?;
+    let target = resolve_target(path, roots)?;
+    let source = target.resolve(roots);
+    if source.is_dir() {
+        bail!("directories are not supported; adopt files one at a time");
+    }
+    if !source.is_file() {
+        bail!("no such file: {path}");
+    }
+    let items = session.desired()?;
+    if let Some(d) = items.iter().find(|d| d.target == target) {
+        bail!("already managed by {}: use rig absorb", d.module);
+    }
+    let sel = session.selection()?;
+    if sel.module(module).is_none() {
+        if session.repo.modules.contains_key(module) {
+            bail!(
+                "module {module} is not active for host {}; add it to hosts/{}.toml first",
+                session.host,
+                session.host
+            );
+        }
+        bail!("no such module {module}; create modules/{module}/");
+    }
+
+    let mut name = target
+        .rel()
+        .file_name()
+        .context("target has no file name")?
+        .to_string_lossy()
+        .into_owned();
+    if host_variant {
+        name.push('@');
+        name.push_str(&session.host);
+    } else if os_variant {
+        name.push('@');
+        name.push_str(
+            session
+                .os
+                .distro
+                .as_deref()
+                .unwrap_or(if session.os.matches("macos") {
+                    "macos"
+                } else {
+                    "linux"
+                }),
+        );
+    }
+    let dest = session
+        .repo
+        .root
+        .join("modules")
+        .join(module)
+        .join(target.module_path())
+        .with_file_name(name);
+    if dest.exists() {
+        bail!("{} already exists", session.rel(&dest));
+    }
+    let content = std::fs::read(&source).with_context(|| format!("reading {path}"))?;
+    let mode = std::fs::metadata(&source)?.permissions().mode() & 0o777;
+    write_atomic(&dest, &content, mode)?;
+
+    let (store, mut state) = Store::open(&state_dir_for(&target, roots)?)?;
+    let hash = store.put_blob(&content)?;
+    state.entries.insert(
+        target.clone(),
+        Entry {
+            hash,
+            module: module.to_string(),
+            mode,
+        },
+    );
+    store.save(&state)?;
+
+    let mut report = Report::default();
+    report.push(
+        Row::new("adopted", &target.to_string())
+            .module(module)
+            .note(&format!("-> {}", session.rel(&dest))),
+    );
+    print_report(&report, false)?;
+    Ok(0)
+}
+
+// Resolve.
+
+fn has_markers(content: &[u8]) -> bool {
+    String::from_utf8_lossy(content).lines().any(|l| {
+        ["<<<<<<<", "|||||||", "=======", ">>>>>>>"]
+            .iter()
+            .any(|m| l.starts_with(m))
+    })
+}
+
+fn run_editor(path: &Path) -> Result<bool> {
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_string());
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$1\""))
+        .arg("sh")
+        .arg(path)
+        .status()
+        .context("running the editor")?;
+    Ok(status.success())
+}
+
+fn resolve(
+    roots: &Roots,
+    path: Option<&str>,
+    host: Option<&str>,
+    etc_only: bool,
+    repo: Option<&Path>,
+    etc_root: Option<&Path>,
+) -> Result<i32> {
+    let session = open(repo, host, false)?;
+    let items = session.desired()?;
+    let only = path.map(|p| resolve_target(p, roots)).transpose()?;
+    let mut exit = 0;
+    let mut report = Report::default();
+    let mut pending_etc = 0;
+
+    for (dir, etc) in state_dirs(roots)? {
+        if etc_only && !etc {
+            continue;
+        }
+        let (store, mut state) = Store::open(&dir)?;
+        for target in store.conflicts()? {
+            if target.is_etc() != etc || only.as_ref().is_some_and(|t| *t != target) {
+                continue;
+            }
+            // SAFETY-free: geteuid has no preconditions.
+            if etc && !etc_only && unsafe { libc::geteuid() } != 0 {
+                pending_etc += 1;
+                continue;
+            }
+            let Some(d) = items.iter().find(|d| d.target == target) else {
+                report.push(
+                    Row::new("conflict", &target.to_string())
+                        .note("no longer in the repo; delete the conflict file by hand")
+                        .exit(1),
+                );
+                continue;
+            };
+            let file = store.root().join("conflicts").join(target.module_path());
+            if !run_editor(&file)? {
+                report.push(
+                    Row::new("conflict", &target.to_string())
+                        .note("editor failed")
+                        .exit(1),
+                );
+                continue;
+            }
+            let content = std::fs::read(&file)?;
+            if has_markers(&content) {
+                report.push(
+                    Row::new("conflict", &target.to_string())
+                        .note("markers remain, left in place")
+                        .exit(1),
+                );
+                continue;
+            }
+            write_atomic(&target.resolve(roots), &content, d.mode)?;
+            record_absorbed(&target, d, &d.content, &store, &mut state)?;
+            store.clear_conflict(&target)?;
+            report.push(
+                Row::new("resolved", &target.to_string())
+                    .module(&d.module)
+                    .note("now edited, run rig absorb"),
+            );
+        }
+    }
+    if pending_etc > 0 {
+        exit = exit.max(escalate_resolve(&session, path, etc_root)?);
+    }
+    print_report(&report, false)?;
+    Ok(exit.max(report.exit()))
+}
+
+fn escalate_resolve(session: &Session, path: Option<&str>, etc_root: Option<&Path>) -> Result<i32> {
+    eprintln!("escalating: /etc conflicts need root");
+    let mut cmd = std::process::Command::new("sudo");
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        cmd.arg("-n");
+    }
+    cmd.arg("--")
+        .arg(std::env::current_exe()?)
+        .arg("resolve")
+        .arg("--etc-only");
+    if let Some(r) = etc_root {
+        cmd.arg("--etc-root").arg(r);
+    }
+    cmd.arg("--host")
+        .arg(&session.host)
+        .arg("--repo")
+        .arg(&session.repo.root);
+    if let Some(p) = path {
+        cmd.arg(p);
+    }
+    Ok(cmd.status().context("running sudo")?.code().unwrap_or(2))
+}
+
+// Init.
+
+fn init(dir: Option<&Path>, host: Option<&str>) -> Result<i32> {
+    let root = match dir {
+        Some(d) => d.to_path_buf(),
+        None => home()?.join("dotfiles"),
+    };
+    std::fs::create_dir_all(&root)?;
+    let host = host.map_or_else(hostname, ToString::to_string);
+    let mut created = Vec::new();
+    let mut put = |rel: &str, content: &str| -> Result<()> {
+        let path = root.join(rel);
+        if path.exists() {
+            return Ok(());
+        }
+        write_atomic(&path, content.as_bytes(), 0o644)?;
+        created.push(rel.to_string());
+        Ok(())
+    };
+    let fresh = !root.join("rig.toml").exists();
+    if fresh {
+        put("rig.toml", "defaults = [\"/usr/share/defaults\"]\n")?;
+        put("modules/.keep", "")?;
+        put(".gitignore", "")?;
+    }
+    put(&format!("hosts/{host}.toml"), "modules = []\n")?;
+
+    if !root.join(".git").exists() {
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .arg(&root)
+            .status()
+            .context("running git init")?;
+        if !status.success() {
+            bail!("git init failed in {}", root.display());
+        }
+    }
+    let cfg = config_dir()?;
+    std::fs::create_dir_all(&cfg)?;
+    let abs = root.canonicalize()?;
+    std::fs::write(cfg.join("repo"), format!("{}\n", abs.display()))?;
+    std::fs::write(cfg.join("host"), format!("{host}\n"))?;
+    for c in &created {
+        println!("created {}", root.join(c).display());
+    }
+    println!("host {host} registered");
+    Ok(0)
 }
