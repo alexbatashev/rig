@@ -1,0 +1,4 @@
+when.os = ["arch"]
+
+[packages]
+arch = ["nvidia-open-dkms"]

@@ -1,0 +1,4 @@
+[directory]
+# the desktop has room for longer paths
+truncation_length = 5
+truncate_to_repo = false

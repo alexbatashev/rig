@@ -1,0 +1,8 @@
+[user]
+	name = Alexander Batashev
+	email = alex@batashev.me
+	signingkey = ~/.ssh/id_ecdsa
+[alias]
+	s = status -s
+[core]
+	editor = hx

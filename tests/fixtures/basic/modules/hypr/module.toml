@@ -1,0 +1,5 @@
+when.os = ["linux"]
+
+[[hook]]
+after = "hyprctl reload"
+when = "changed"

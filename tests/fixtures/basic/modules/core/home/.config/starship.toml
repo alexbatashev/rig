@@ -1,0 +1,7 @@
+[character]
+# the prompt arrow
+success_symbol = "[>](bold green)"
+error_symbol = "[x](bold red)"
+
+[directory]
+truncation_length = 3

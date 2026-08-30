@@ -1,0 +1,3 @@
+[packages]
+arch = ["fish", "starship"]
+macos = ["fish", "starship"]

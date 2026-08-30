@@ -1,0 +1,11 @@
+[git_branch]
+symbol = " "
+[character]
+# the prompt arrow
+success_symbol = "[>](bold green)"
+error_symbol = "[x](bold red)"
+
+[directory]
+# the desktop has room for longer paths
+truncation_length = 5
+truncate_to_repo = false
