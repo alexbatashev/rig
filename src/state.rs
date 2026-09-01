@@ -54,10 +54,22 @@ pub struct Entry {
     pub mode: u32,
 }
 
+/// How a package came to be in the ledger, which decides what leaving the repo means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Origin {
+    /// rig installed it, so rig removes it.
+    Installed,
+    /// It was already there when a module first listed it, so rig leaves it.
+    Adopted,
+}
+
+pub type Tracked = BTreeMap<String, Origin>;
+
 #[derive(Clone, Debug, Default)]
 pub struct State {
     pub entries: BTreeMap<Target, Entry>,
-    pub packages: BTreeMap<Backend, BTreeSet<String>>,
+    pub packages: BTreeMap<Backend, Tracked>,
     pub macos_casks: BTreeSet<String>,
     /// `provider:domain.key` to the value rig last wrote or adopted.
     pub settings: BTreeMap<String, String>,
@@ -83,13 +95,32 @@ struct MetaToml {
     macos_casks: BTreeSet<String>,
 }
 
+/// A backend's ledger; the list form predates `Origin` and means "rig installed these".
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum TrackedToml {
+    Origins(Tracked),
+    Names(BTreeSet<String>),
+}
+
+impl From<TrackedToml> for Tracked {
+    fn from(t: TrackedToml) -> Tracked {
+        match t {
+            TrackedToml::Origins(m) => m,
+            TrackedToml::Names(names) => {
+                names.into_iter().map(|n| (n, Origin::Installed)).collect()
+            }
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Manifest {
     version: u32,
     #[serde(default)]
     targets: BTreeMap<String, EntryToml>,
     #[serde(default)]
-    packages: BTreeMap<Backend, BTreeSet<String>>,
+    packages: BTreeMap<Backend, TrackedToml>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     packages_meta: Option<MetaToml>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -169,7 +200,7 @@ impl Store {
         }
         let state = State {
             entries,
-            packages: m.packages,
+            packages: m.packages.into_iter().map(|(b, t)| (b, t.into())).collect(),
             macos_casks: m.packages_meta.unwrap_or_default().macos_casks,
             settings: m.settings,
         };
@@ -202,7 +233,11 @@ impl Store {
                     )
                 })
                 .collect(),
-            packages: state.packages.clone(),
+            packages: state
+                .packages
+                .iter()
+                .map(|(b, t)| (*b, TrackedToml::Origins(t.clone())))
+                .collect(),
             settings: state.settings.clone(),
             packages_meta: (!state.macos_casks.is_empty()).then(|| MetaToml {
                 macos_casks: state.macos_casks.clone(),
@@ -330,15 +365,35 @@ mod tests {
                 mode: 0o644,
             },
         );
-        state
-            .packages
-            .insert(Backend::Arch, ["ghostty".to_string()].into());
+        state.packages.insert(
+            Backend::Arch,
+            [
+                ("ghostty".to_string(), Origin::Installed),
+                ("vim".to_string(), Origin::Adopted),
+            ]
+            .into(),
+        );
         store.save(&state).unwrap();
 
         let (store2, back) = Store::open(dir.path()).unwrap();
         assert_eq!(back.entries, state.entries);
         assert_eq!(back.packages, state.packages);
         assert_eq!(store2.blob(&hash).unwrap().unwrap(), b"content\n");
+    }
+
+    #[test]
+    fn legacy_package_lists_read_as_installed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("manifest.toml"),
+            "version = 1\n[packages]\narch = [\"ghostty\"]\n",
+        )
+        .unwrap();
+        let (_, state) = Store::open(dir.path()).unwrap();
+        assert_eq!(
+            state.packages[&Backend::Arch],
+            [("ghostty".to_string(), Origin::Installed)].into()
+        );
     }
 
     #[test]

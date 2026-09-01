@@ -10,7 +10,7 @@ pub mod nix;
 use crate::exec::{Confirm, Policy};
 use crate::repo::{Backend, Os, Selection};
 use crate::report::{Report, Row};
-use crate::state::{State, Store};
+use crate::state::{Origin, State, Store, Tracked};
 use anyhow::Result;
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -156,16 +156,60 @@ fn error_row(kind: Backend, e: &anyhow::Error) -> Row {
         .exit(2)
 }
 
+/// Brings the ledger in line with what is wanted and present, returning what to install
+/// and what to remove. Wanted and present but untracked is adopted: it was there before
+/// rig, so rig keeps it when it leaves the repo.
+fn settle(
+    kind: Backend,
+    want: &BTreeSet<String>,
+    present: &BTreeSet<String>,
+    tracked: &mut Tracked,
+    report: &mut Report,
+) -> (Vec<String>, Vec<String>) {
+    let to_add: Vec<String> = want.difference(present).cloned().collect();
+    for name in want.intersection(present) {
+        if !tracked.contains_key(name) {
+            tracked.insert(name.clone(), Origin::Adopted);
+            report.push(
+                Row::new("package", &format!("{kind}: {name}"))
+                    .module("adopted")
+                    .quietly(),
+            );
+        }
+    }
+    let mut to_remove = Vec::new();
+    for (name, origin) in tracked.clone() {
+        if want.contains(&name) {
+            continue;
+        }
+        match origin {
+            Origin::Installed if present.contains(&name) => to_remove.push(name),
+            // Something rig installed that is already gone just leaves the ledger.
+            Origin::Installed => {
+                tracked.remove(&name);
+            }
+            Origin::Adopted => {
+                tracked.remove(&name);
+                report.push(
+                    Row::new("orphaned", &format!("{kind}: {name}"))
+                        .note("not installed by rig, kept"),
+                );
+            }
+        }
+    }
+    (to_add, to_remove)
+}
+
 fn step(
     backend: &mut dyn PackageBackend,
     want: &BTreeSet<String>,
-    mut tracked: BTreeSet<String>,
+    mut tracked: Tracked,
     state: &mut State,
     opts: Options,
     report: &mut Report,
 ) {
     let kind = backend.kind();
-    let query: BTreeSet<String> = want.union(&tracked).cloned().collect();
+    let query: BTreeSet<String> = want.iter().chain(tracked.keys()).cloned().collect();
     let present = match backend.installed(&query, opts.policy) {
         Ok(p) => p,
         Err(e) => {
@@ -185,13 +229,7 @@ fn step(
             }
         }
     };
-    let to_add: Vec<String> = want.difference(&present).cloned().collect();
-    let unwanted: BTreeSet<String> = tracked.difference(want).cloned().collect();
-    // Something rig installed that is already gone just leaves the ledger.
-    for name in unwanted.difference(&present) {
-        tracked.remove(name);
-    }
-    let to_remove: Vec<String> = unwanted.intersection(&present).cloned().collect();
+    let (to_add, to_remove) = settle(kind, want, &present, &mut tracked, report);
 
     if to_add.is_empty() && to_remove.is_empty() {
         if !prepare(backend, report) {
@@ -200,7 +238,9 @@ fn step(
         let mut row = Row::new("package", &format!("{kind}: {} ok", want.len()));
         row.quiet = true;
         report.push(row);
-        state.packages.insert(kind, tracked);
+        if !opts.dry_run {
+            state.packages.insert(kind, tracked);
+        }
         return;
     }
     if opts.dry_run {
@@ -241,14 +281,14 @@ fn step(
                 .unwrap_or_default();
             for n in &landed {
                 report.push(Row::new("package", &format!("{kind}: {n}")).module("installed"));
+                tracked.insert(n.clone(), Origin::Installed);
             }
-            tracked.extend(landed);
             report.push(error_row(kind, &e));
             state.packages.insert(kind, tracked);
             return;
         }
-        tracked.extend(to_add.iter().cloned());
         for n in &to_add {
+            tracked.insert(n.clone(), Origin::Installed);
             report.push(Row::new("package", &format!("{kind}: {n}")).module("installed"));
         }
     }
