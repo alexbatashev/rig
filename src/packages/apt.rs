@@ -56,7 +56,7 @@ impl PackageBackend for Apt {
             if done.stderr.contains("Unable to locate package") {
                 return Err(NotFound(name.clone()).into());
             }
-            anyhow::bail!("apt-get install {name} failed with exit {}", done.code);
+            anyhow::bail!("apt-get install {name} failed: {}", done.reason());
         }
         Ok(())
     }

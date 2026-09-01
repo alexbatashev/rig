@@ -460,6 +460,7 @@ fn up(args: &UpArgs, roots: &Roots, etc_root: Option<&Path>) -> Result<i32> {
             exit = exit.max(code);
             // The child printed its own rows; keep them here only so hooks see the writes.
             if code < 2 {
+                report.shown_elsewhere(actionable.len());
                 for p in &actionable {
                     report.push(Row::from_plan(p).quietly());
                 }

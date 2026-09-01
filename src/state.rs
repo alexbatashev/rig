@@ -157,7 +157,7 @@ impl From<SettingToml> for Setting {
                 original: match original {
                     Some(o) => Original::Value(crate::settings::Observed {
                         value: o.value,
-                        kind: o.kind,
+                        kind: Some(o.kind),
                     }),
                     None if unset => Original::Unset,
                     None => Original::Unknown,
@@ -174,9 +174,9 @@ impl From<&Setting> for SettingToml {
         SettingToml::Full {
             current: s.current.clone(),
             original: match &s.original {
-                Original::Value(v) => Some(OriginalToml {
+                Original::Value(v) => v.kind.as_ref().map(|kind| OriginalToml {
                     value: v.value.clone(),
-                    kind: v.kind.clone(),
+                    kind: kind.clone(),
                 }),
                 _ => None,
             },
@@ -502,7 +502,7 @@ mod tests {
             current: "1".into(),
             original: Original::Value(crate::settings::Observed {
                 value: "2".into(),
-                kind: "integer".into(),
+                kind: Some("integer".into()),
             }),
             domain: Some("NSGlobalDomain".into()),
             key: Some("KeyRepeat".into()),

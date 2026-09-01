@@ -267,9 +267,11 @@ fn step(
                 .module("declined")
                 .exit(1),
         );
+        state.packages.insert(kind, tracked);
         return;
     }
     if !prepare(backend, report) {
+        state.packages.insert(kind, tracked);
         return;
     }
 
@@ -281,14 +283,15 @@ fn step(
                 .unwrap_or_default();
             for n in &landed {
                 report.push(Row::new("package", &format!("{kind}: {n}")).module("installed"));
-                tracked.insert(n.clone(), Origin::Installed);
+                tracked.entry(n.clone()).or_insert(Origin::Installed);
             }
             report.push(error_row(kind, &e));
             state.packages.insert(kind, tracked);
             return;
         }
         for n in &to_add {
-            tracked.insert(n.clone(), Origin::Installed);
+            // Put back by hand-removal stays adopted: it was there before rig.
+            tracked.entry(n.clone()).or_insert(Origin::Installed);
             report.push(Row::new("package", &format!("{kind}: {n}")).module("installed"));
         }
     }

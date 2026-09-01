@@ -15,7 +15,8 @@ case "$1" in
       -int) echo "Type is integer" ;;
       -bool) echo "Type is boolean" ;;
       -float) echo "Type is float" ;;
-      *) echo "Type is string" ;;
+      -string) echo "Type is string" ;;
+      *) echo "Type is array" ;;
     esac ;;
   write)
     grep -v "^$2 $3 " "$FAKE_DEFAULTS" > "$FAKE_DEFAULTS.t"; mv "$FAKE_DEFAULTS.t" "$FAKE_DEFAULTS"
@@ -244,6 +245,29 @@ fn dropped_key_restores_the_original() {
     let again = up(&sb, &[]);
     assert_eq!(again.stdout, "nothing to do\n");
     assert!(writes(&sb).is_empty(), "{:?}", sb.log());
+}
+
+#[test]
+fn unwritable_original_is_forgotten_not_retried() {
+    let sb = sandbox("macos");
+    let db = sb.root.path().join("fake.defaults");
+    std::fs::write(&db, "NSGlobalDomain InitialKeyRepeat -array 1\n").unwrap();
+    up(&sb, &[]);
+    sb.write_repo(
+        "modules/a/module.toml",
+        "[defaults.NSGlobalDomain]\nKeyRepeat = 1\nApplePressAndHoldEnabled = false\n",
+    );
+    std::fs::write(sb.log_path(), "").unwrap();
+    let run = up(&sb, &[]);
+    assert_eq!(run.status, 1, "{}{}", run.stdout, run.stderr);
+    assert!(
+        run.stdout.contains("original unknown, kept"),
+        "{}",
+        run.stdout
+    );
+    assert!(writes(&sb).is_empty(), "{:?}", sb.log());
+    let again = up(&sb, &[]);
+    assert_eq!(again.status, 0, "{}{}", again.stdout, again.stderr);
 }
 
 #[test]

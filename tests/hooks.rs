@@ -201,7 +201,7 @@ fn hook_output_streams_to_stderr() {
 #[test]
 fn file_rows_print_before_the_hook_runs() {
     let sb = sandbox();
-    sb.fake_bin("hookrun", "#!/bin/sh\necho reloaded-$1\n");
+    sb.fake_bin("hookrun", "#!/bin/sh\nsleep 0.2\necho reloaded-$1\n");
     let repo = sb.repo.to_str().unwrap().to_string();
     let text = sb.rig_merged(&["up", "--host", "box", "-y", &repo]);
     let created = text.find("created    ~/.config/a.conf").unwrap();

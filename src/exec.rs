@@ -155,11 +155,14 @@ impl Done {
         self.code == 0
     }
 
-    /// The last lines of stderr, joined for a one-line note.
+    /// The last thing the process said on stderr, for a one-line note.
     #[must_use]
     pub fn reason(&self) -> String {
-        let tail: Vec<&str> = self.stderr.lines().rev().take(20).collect();
-        tail.into_iter().rev().collect::<Vec<_>>().join("; ")
+        self.stderr
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .map_or_else(|| format!("exit {}", self.code), |l| l.trim().to_string())
     }
 }
 
@@ -215,7 +218,7 @@ pub fn try_run(cmd: &Cmd, policy: Policy) -> Result<Done> {
 pub fn run(cmd: &Cmd, policy: Policy) -> Result<Done> {
     let done = try_run(cmd, policy)?;
     if !done.ok() {
-        bail!("{} failed with exit {}", cmd.program, done.code);
+        bail!("{} failed: {}", cmd.program, done.reason());
     }
     Ok(done)
 }

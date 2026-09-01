@@ -11,10 +11,11 @@ use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A value as the settings tool reports it, with the type it would need to write it back.
+/// No type means rig can read it but never write it back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Observed {
     pub value: String,
-    pub kind: String,
+    pub kind: Option<String>,
 }
 
 pub trait Provider {
@@ -242,30 +243,27 @@ fn restore(
     let Some(p) = providers.iter().find(|p| p.name() == name) else {
         return false;
     };
-    let (Some(domain), Some(k)) = (&setting.domain, &setting.key) else {
+    let action = match (&setting.original, &setting.domain, &setting.key) {
+        (Original::Value(v), Some(_), Some(_)) if v.kind.is_some() => "restore",
+        (Original::Unset, Some(_), Some(_)) => "delete",
+        _ => "forget",
+    };
+    if opts.dry_run {
+        report.push(Row::new("setting", label).module(&format!("would {action}")));
+        return false;
+    }
+    if action == "forget" {
         report.push(
             Row::new("orphaned", label)
                 .note("original unknown, kept")
                 .exit(1),
         );
         return true;
-    };
-    let action = match &setting.original {
-        Original::Unknown => {
-            report.push(
-                Row::new("orphaned", label)
-                    .note("original unknown, kept")
-                    .exit(1),
-            );
-            return true;
-        }
-        Original::Unset => "delete",
-        Original::Value(_) => "restore",
-    };
-    if opts.dry_run {
-        report.push(Row::new("setting", label).module(&format!("would {action}")));
-        return false;
     }
+    let (domain, k) = (
+        setting.domain.as_deref().unwrap_or_default(),
+        setting.key.as_deref().unwrap_or_default(),
+    );
     let done = match &setting.original {
         Original::Value(v) => p.write(domain, k, v, opts.policy),
         _ => p.delete(domain, k, opts.policy),
@@ -332,12 +330,11 @@ pub fn sync(
                 continue;
             }
         }
-        let original = match state.settings.get(&item.state_key()) {
-            Some(prev) => prev.original.clone(),
-            None => item
-                .machine
-                .clone()
-                .map_or(Original::Unset, Original::Value),
+        let original = match (state.settings.get(&item.state_key()), &item.machine) {
+            (Some(prev), _) => prev.original.clone(),
+            (None, None) => Original::Unset,
+            (None, Some(m)) if m.kind.is_some() => Original::Value(m.clone()),
+            (None, Some(_)) => Original::Unknown,
         };
         state.settings.insert(
             item.state_key(),

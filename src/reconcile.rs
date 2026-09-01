@@ -281,6 +281,11 @@ pub fn reconcile(
         let module = Some(entry.module.clone());
         plans.push(match disk.read(target)? {
             None => Plan::new(target.clone(), module, Outcome::Deleted, Action::Forget),
+            Some(_) if disk.link_target(target).is_some() => {
+                let mut p = Plan::new(target.clone(), module, Outcome::Orphaned, Action::Forget);
+                p.note = Some("foreign symlink, kept".into());
+                p
+            }
             Some(k) if Hash::of(&k) == entry.hash => {
                 let mut p = Plan::new(
                     target.clone(),
@@ -599,6 +604,18 @@ mod tests {
         let p = orphan(Some("edited\n"), true);
         assert_eq!(p.outcome, Outcome::Orphaned);
         assert_eq!(p.action, Action::Nothing);
+    }
+
+    #[test]
+    fn orphan_symlink_is_forgotten_not_deleted() {
+        let mut c = Case::new()
+            .last_written("L\n")
+            .linked_to("L\n", "/elsewhere");
+        c.opts.prune = true;
+        let mut plans = reconcile(&[], &c.state, &c.disk, &c.blobs, &c.opts).unwrap();
+        let p = plans.remove(0);
+        assert_eq!(p.outcome, Outcome::Orphaned);
+        assert_eq!(p.action, Action::Forget);
     }
 
     #[test]

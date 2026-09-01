@@ -16,7 +16,8 @@ pub struct Sandbox {
 /// so a test can never invoke the real package manager.
 const SYSTEM_TOOLS: &[&str] = &[
     "sh", "bash", "env", "printf", "basename", "dirname", "cat", "grep", "sed", "mv", "cp", "rm",
-    "ls", "head", "tail", "sort", "wc", "chmod", "mkdir", "true", "false", "uname", "git",
+    "ls", "head", "tail", "sort", "wc", "chmod", "mkdir", "touch", "sleep", "true", "false",
+    "uname", "git",
 ];
 
 fn link_system_tools(into: &Path) {

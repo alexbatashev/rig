@@ -73,7 +73,7 @@ impl PackageBackend for Arch {
                 {
                     return Err(NotFound(name.clone()).into());
                 }
-                bail!("{helper} -S {name} failed with exit {}", done.code);
+                bail!("{helper} -S {name} failed: {}", done.reason());
             }
         }
         Ok(())

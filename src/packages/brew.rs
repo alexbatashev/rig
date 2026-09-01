@@ -51,14 +51,14 @@ impl PackageBackend for Brew {
                 continue;
             }
             if !missing_formula(&done.stderr) {
-                anyhow::bail!("brew install {name} failed with exit {}", done.code);
+                anyhow::bail!("brew install {name} failed: {}", done.reason());
             }
             let done = try_run(&Cmd::new("brew", &["install", "--cask", name]), policy)?;
             if !done.ok() {
                 if missing_formula(&done.stderr) {
                     return Err(NotFound(name.clone()).into());
                 }
-                anyhow::bail!("brew install --cask {name} failed with exit {}", done.code);
+                anyhow::bail!("brew install --cask {name} failed: {}", done.reason());
             }
             self.casks.insert(name.clone());
         }

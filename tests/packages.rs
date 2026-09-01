@@ -767,6 +767,43 @@ fn dry_run_queries_only() {
         sb.log()
     );
     assert!(!sb.state_dir().join("manifest.toml").exists());
+
+    up(&sb, &[]);
+    let before = manifest(&sb);
+    sb.write_repo(
+        "modules/tools/module.toml",
+        "[packages]\narch = [\"vim\"]\n",
+    );
+    up(&sb, &["-n"]);
+    assert_eq!(manifest(&sb), before);
+}
+
+#[test]
+fn declined_prompt_still_records_adoptions() {
+    let sb = sandbox("linux:arch");
+    sb.set_installed(&["ghostty"]);
+    let repo = sb.repo.to_str().unwrap().to_string();
+    let run = sb.rig(&["up", "--host", "box", &repo]);
+    assert_eq!(run.status, 1, "{}{}", run.stdout, run.stderr);
+    assert!(
+        manifest(&sb).contains("ghostty = \"adopted\""),
+        "{}",
+        manifest(&sb)
+    );
+}
+
+#[test]
+fn reinstalling_an_adopted_package_keeps_it_adopted() {
+    let sb = sandbox("linux:arch");
+    sb.set_installed(&["ghostty", "ripgrep"]);
+    up(&sb, &[]);
+    sb.set_installed(&["ripgrep"]);
+    up(&sb, &[]);
+    assert!(
+        manifest(&sb).contains("ghostty = \"adopted\""),
+        "{}",
+        manifest(&sb)
+    );
 }
 
 #[test]

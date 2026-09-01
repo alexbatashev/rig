@@ -454,6 +454,52 @@ fn etc_escalates_through_sudo() {
 }
 
 #[test]
+fn etc_only_change_prints_the_child_rows_and_nothing_else() {
+    let sb = etc_sandbox(FAKE_SUDO);
+    etc_up(&sb, &[]);
+    sb.write_repo(
+        "modules/nvidia/etc/modprobe.d/nvidia.conf",
+        "options nvidia_drm modeset=0\n",
+    );
+    let run = etc_up(&sb, &[]);
+    assert_eq!(run.status, 0, "{}{}", run.stdout, run.stderr);
+    assert!(
+        run.stdout
+            .contains("updated    /etc/modprobe.d/nvidia.conf"),
+        "{}",
+        run.stdout
+    );
+    assert!(!run.stdout.contains("nothing to do"), "{}", run.stdout);
+}
+
+#[test]
+fn prune_forgets_a_foreign_symlink_instead_of_deleting_it() {
+    let sb = home_only();
+    up(&sb, &[]);
+    let elsewhere = sb.root.path().join("store/gitignore");
+    std::fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
+    std::fs::copy(sb.home.join(".gitignore_default"), &elsewhere).unwrap();
+    std::fs::remove_file(sb.home.join(".gitignore_default")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, sb.home.join(".gitignore_default")).unwrap();
+    std::fs::remove_file(sb.repo.join("modules/git/home/.gitignore_default")).unwrap();
+
+    let run = up(&sb, &["--prune"]);
+    assert_eq!(run.outcome("~/.gitignore_default").unwrap(), "orphaned");
+    assert!(
+        run.stdout.contains("foreign symlink, kept"),
+        "{}",
+        run.stdout
+    );
+    assert!(sb.home.join(".gitignore_default").is_symlink());
+    let again = up(&sb, &["--prune"]);
+    assert!(
+        again.outcome("~/.gitignore_default").is_none(),
+        "{}",
+        again.stdout
+    );
+}
+
+#[test]
 fn etc_unchanged_does_not_escalate() {
     let sb = etc_sandbox(FAKE_SUDO);
     etc_up(&sb, &[]);

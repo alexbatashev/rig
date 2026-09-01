@@ -54,7 +54,8 @@ impl Row {
         self
     }
 
-    /// An orphan whose file is already gone leaves nothing to report.
+    /// Forgetting settles a row, so it never fails the run; an orphan whose file is
+    /// already gone is not even worth a line.
     #[must_use]
     pub fn from_plan(plan: &Plan) -> Row {
         let forgotten = matches!(plan.action, Action::Forget);
@@ -69,7 +70,7 @@ impl Row {
             module: plan.module.clone(),
             note: plan.note.clone(),
             exit,
-            quiet: plan.outcome.is_quiet() || forgotten,
+            quiet: plan.outcome.is_quiet() || (forgotten && plan.outcome == Outcome::Deleted),
             wrote: matches!(plan.action, Action::Write { .. }),
         }
     }
@@ -119,6 +120,11 @@ impl Report {
             }
         }
         self.rows.push(row);
+    }
+
+    /// Counts rows another process already printed on this stdout.
+    pub fn shown_elsewhere(&mut self, n: usize) {
+        self.shown += n;
     }
 
     /// Says so when a live run printed nothing.

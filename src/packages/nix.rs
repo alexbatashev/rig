@@ -73,7 +73,7 @@ impl PackageBackend for Nix {
             if done.stderr.contains("does not provide attribute") {
                 return Err(NotFound(name.clone()).into());
             }
-            anyhow::bail!("nix profile install {name} failed with exit {}", done.code);
+            anyhow::bail!("nix profile install {name} failed: {}", done.reason());
         }
         Ok(())
     }
@@ -88,7 +88,7 @@ impl PackageBackend for Nix {
             return Ok(());
         }
         if !done.stderr.contains("unknown element") {
-            anyhow::bail!("nix profile remove failed with exit {}", done.code);
+            anyhow::bail!("nix profile remove failed: {}", done.reason());
         }
         for name in &short {
             run(

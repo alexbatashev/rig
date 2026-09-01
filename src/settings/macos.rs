@@ -1,6 +1,6 @@
 use super::{Observed, Provider};
 use crate::exec::{query, run, which, Cmd, Policy};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 pub struct Defaults;
 
@@ -39,8 +39,8 @@ impl Provider for Defaults {
             .stdout
             .trim()
             .strip_prefix("Type is ")
-            .unwrap_or("string")
-            .to_string();
+            .filter(|k| flag(k).is_ok())
+            .map(ToString::to_string);
         Ok(Some(Observed {
             value: done.stdout.trim().to_string(),
             kind,
@@ -48,10 +48,14 @@ impl Provider for Defaults {
     }
 
     fn write(&self, domain: &str, key: &str, value: &Observed, policy: Policy) -> Result<()> {
+        let kind = value
+            .kind
+            .as_deref()
+            .context("value has no writable type")?;
         run(
             &Cmd::new(
                 "defaults",
-                &["write", domain, key, flag(&value.kind)?, &value.value],
+                &["write", domain, key, flag(kind)?, &value.value],
             ),
             policy,
         )?;
@@ -67,19 +71,19 @@ impl Provider for Defaults {
         Ok(match value {
             toml::Value::Boolean(b) => Observed {
                 value: u8::from(*b).to_string(),
-                kind: "boolean".into(),
+                kind: Some("boolean".into()),
             },
             toml::Value::Integer(i) => Observed {
                 value: i.to_string(),
-                kind: "integer".into(),
+                kind: Some("integer".into()),
             },
             toml::Value::Float(f) => Observed {
                 value: f.to_string(),
-                kind: "float".into(),
+                kind: Some("float".into()),
             },
             toml::Value::String(s) => Observed {
                 value: s.clone(),
-                kind: "string".into(),
+                kind: Some("string".into()),
             },
             _ => bail!("defaults values must be scalars"),
         })
