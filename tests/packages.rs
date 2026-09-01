@@ -458,7 +458,10 @@ mod mise {
         assert_eq!(run.status, 0, "{}{}", run.stdout, run.stderr);
         assert_eq!(
             mise_calls(&sb),
-            vec!["mise ls --json --installed", "mise install"]
+            vec![
+                "mise ls --json --installed",
+                "mise install gh npm:@anthropic-ai/claude-code"
+            ]
         );
         assert_eq!(rig_toml(&sb).as_deref(), Some(RIG_TOML));
         assert!(run.stdout.contains("mise: gh"), "{}", run.stdout);
@@ -612,9 +615,9 @@ mod canonical {
             let run = up(&sb, &[]);
             assert_eq!(run.status, 0, "{}{}", run.stdout, run.stderr);
             let log = sb.log().join("\n");
-            assert!(log.contains("mise install"), "{os}: {log}");
+            assert!(log.contains("mise install gh"), "{os}: {log}");
             assert!(
-                !log.contains("install gh") && !log.contains("noconfirm gh"),
+                !log.contains("brew install gh") && !log.contains("noconfirm gh"),
                 "{os}: {log}"
             );
         }

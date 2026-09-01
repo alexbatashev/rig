@@ -371,9 +371,15 @@ fn no_repo_configured_is_an_error() {
 
 const NVIDIA: &str = "etc/modprobe.d/nvidia.conf";
 
+/// An arch host whose packages are all present, so only the `/etc` phase has work to do.
 fn etc_sandbox(sudo: &str) -> Sandbox {
     let sb = Sandbox::with_fixture("basic").with_os("linux:arch");
     sb.fake_bin("sudo", sudo);
+    sb.fake_bin(
+        "pacman",
+        "#!/bin/sh\ncase \"$1\" in -Qq) cat \"$FAKE_INSTALLED\";; esac\nexit 0\n",
+    );
+    sb.set_installed(&["fish", "starship", "ghostty", "nvidia-open-dkms"]);
     sb
 }
 

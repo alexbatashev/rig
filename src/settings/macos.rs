@@ -1,5 +1,5 @@
 use super::Provider;
-use crate::exec::{run, try_run, which, Cmd, Policy};
+use crate::exec::{query, run, which, Cmd, Policy};
 use anyhow::{bail, Result};
 
 pub struct Defaults;
@@ -24,14 +24,17 @@ impl Provider for Defaults {
     }
 
     fn read(&self, domain: &str, key: &str, policy: Policy) -> Result<Option<String>> {
-        let (stdout, stderr, ok) = try_run(&Cmd::new("defaults", &["read", domain, key]), policy)?;
-        if ok {
-            return Ok(Some(stdout.trim().to_string()));
+        let done = query(&Cmd::new("defaults", &["read", domain, key]), policy)?;
+        if done.ok() {
+            return Ok(Some(done.stdout.trim().to_string()));
         }
-        if stderr.contains("does not exist") {
+        if done.stderr.contains("does not exist") {
             return Ok(None);
         }
-        bail!("defaults read {domain} {key} failed: {}", stderr.trim())
+        bail!(
+            "defaults read {domain} {key} failed: {}",
+            done.stderr.trim()
+        )
     }
 
     fn write(&self, domain: &str, key: &str, value: &toml::Value, policy: Policy) -> Result<()> {

@@ -1,5 +1,6 @@
 //! Commands a module runs after its files were written.
 
+use crate::exec::{try_run, Cmd, Policy};
 use crate::repo::{HookWhen, Selection};
 use crate::report::Row;
 use std::collections::BTreeMap;
@@ -18,7 +19,6 @@ pub struct HookRun {
     pub module: String,
     pub command: String,
     pub status: HookStatus,
-    pub output: String,
 }
 
 /// Runs each active module's hooks in host order, after files and packages.
@@ -34,7 +34,7 @@ pub fn run_hooks(
         let wrote = changed.get(&m.name).map_or(&[][..], Vec::as_slice);
         for hook in &m.hooks {
             let wanted = hook.when == HookWhen::Always || !wrote.is_empty();
-            let run = HookRun {
+            let mut run = HookRun {
                 module: m.name.clone(),
                 command: hook.after.clone(),
                 status: match (wanted, dry_run) {
@@ -42,56 +42,38 @@ pub fn run_hooks(
                     (true, true) => HookStatus::WouldRun,
                     (true, false) => HookStatus::Ran,
                 },
-                output: String::new(),
             };
             if run.status == HookStatus::Ran {
-                out.push(execute(run, home, &sel.host, wrote));
-            } else {
-                out.push(run);
+                run.status = execute(&run, home, &sel.host, wrote);
             }
+            out.push(run);
         }
     }
     out
 }
 
-fn tail(text: &str) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    lines[lines.len().saturating_sub(20)..].join("\n")
-}
-
-fn execute(mut run: HookRun, home: &Path, host: &str, wrote: &[PathBuf]) -> HookRun {
+fn execute(run: &HookRun, home: &Path, host: &str, wrote: &[PathBuf]) -> HookStatus {
     let changed: Vec<String> = wrote.iter().map(|p| p.display().to_string()).collect();
-    let result = std::process::Command::new("/bin/sh")
-        .arg("-c")
-        .arg(&run.command)
-        .current_dir(home)
+    let cmd = Cmd::new("/bin/sh", &["-c", &run.command])
         .env("RIG_MODULE", &run.module)
         .env("RIG_HOST", host)
-        .env("RIG_CHANGED", changed.join("\n"))
-        .output();
-    match result {
-        Ok(out) => {
-            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-            text.push_str(&String::from_utf8_lossy(&out.stderr));
-            run.output = tail(&text);
-            if !out.status.success() {
-                run.status = HookStatus::Failed(out.status.code().unwrap_or(1));
-            }
-        }
+        .env("RIG_CHANGED", &changed.join("\n"))
+        .in_dir(home.to_path_buf());
+    match try_run(&cmd, Policy::default()) {
+        Ok(done) if done.ok() => HookStatus::Ran,
+        Ok(done) => HookStatus::Failed(done.code),
         Err(e) => {
-            run.status = HookStatus::Failed(1);
-            run.output = e.to_string();
+            eprintln!("    {e:#}");
+            HookStatus::Failed(1)
         }
     }
-    run
 }
 
 /// One row per hook that fired, plus `(none)` for a module whose hooks all sat out.
 ///
-/// `show_none` suppresses the `(none)` rows on a run that changed nothing at all;
-/// `verbose` attaches each hook's captured output.
+/// `show_none` suppresses the `(none)` rows on a run that changed nothing at all.
 #[must_use]
-pub fn rows(runs: &[HookRun], show_none: bool, verbose: bool) -> Vec<Row> {
+pub fn rows(runs: &[HookRun], show_none: bool) -> Vec<Row> {
     let mut out: Vec<Row> = Vec::new();
     let mut fired: BTreeMap<&str, bool> = BTreeMap::new();
     for r in runs {
@@ -100,11 +82,7 @@ pub fn rows(runs: &[HookRun], show_none: bool, verbose: bool) -> Vec<Row> {
             HookStatus::Skipped => {}
             HookStatus::Ran => {
                 *entry = true;
-                let mut row = Row::new("hook", &format!("{}: {}", r.module, r.command));
-                if verbose && !r.output.is_empty() {
-                    row = row.note(&r.output);
-                }
-                out.push(row);
+                out.push(Row::new("hook", &format!("{}: {}", r.module, r.command)));
             }
             HookStatus::WouldRun => {
                 *entry = true;
@@ -120,7 +98,6 @@ pub fn rows(runs: &[HookRun], show_none: bool, verbose: bool) -> Vec<Row> {
                         "hook",
                         &format!("{}: FAILED (exit {code}): {}", r.module, r.command),
                     )
-                    .note(&r.output)
                     .exit(2),
                 );
             }

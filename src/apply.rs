@@ -69,7 +69,7 @@ fn perform(plan: &Plan, roots: &Roots, store: &Store, state: &mut State) -> Resu
     Ok(())
 }
 
-/// Carries out the plans in target order and returns the rows to print.
+/// Carries out the plans in target order, pushing one row per plan as it goes.
 ///
 /// # Errors
 /// When the manifest cannot be saved.
@@ -79,8 +79,8 @@ pub fn apply(
     store: &Store,
     state: &mut State,
     dry_run: bool,
-) -> Result<Report> {
-    let mut report = Report::default();
+    report: &mut Report,
+) -> Result<()> {
     for plan in plans {
         if dry_run {
             report.push(dry_row(plan));
@@ -101,7 +101,7 @@ pub fn apply(
     if !dry_run {
         store.save(state)?;
     }
-    Ok(report)
+    Ok(())
 }
 
 /// The row a plan would produce, marked for `--dry-run`.

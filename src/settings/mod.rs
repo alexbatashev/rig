@@ -136,7 +136,8 @@ fn rows_for_unavailable(unavailable: &[&str], report: &mut Report) {
     for name in unavailable {
         report.push(
             Row::new("skipped", &format!("settings: {name}"))
-                .module(&format!("{name} tool not on PATH")),
+                .module(&format!("{name} tool not on PATH"))
+                .exit(1),
         );
     }
 }
@@ -150,10 +151,10 @@ pub fn status(
     sel: &Selection,
     state: &State,
     policy: Policy,
-) -> Result<Report> {
+    report: &mut Report,
+) -> Result<()> {
     let (items, unavailable) = plan(providers, sel, state, policy)?;
-    let mut report = Report::default();
-    rows_for_unavailable(&unavailable, &mut report);
+    rows_for_unavailable(&unavailable, report);
     for item in &items {
         match item.outcome {
             Outcome::Edited => report.push(edited_row(item)),
@@ -169,7 +170,7 @@ pub fn status(
             Outcome::Ok | Outcome::Adopted => {}
         }
     }
-    Ok(report)
+    Ok(())
 }
 
 fn edited_row(item: &Item) -> Row {
@@ -194,10 +195,10 @@ pub fn sync(
     sel: &Selection,
     state: &mut State,
     opts: Options,
-) -> Result<Report> {
+    report: &mut Report,
+) -> Result<()> {
     let (items, unavailable) = plan(providers, sel, state, opts.policy)?;
-    let mut report = Report::default();
-    rows_for_unavailable(&unavailable, &mut report);
+    rows_for_unavailable(&unavailable, report);
     let mut ok: BTreeMap<&str, usize> = BTreeMap::new();
     let mut declared: BTreeMap<&str, usize> = BTreeMap::new();
     let provider = |name: &str| providers.iter().find(|p| p.name() == name).unwrap();
@@ -252,7 +253,7 @@ pub fn sync(
             report.push(Row::new("setting", &format!("{name}: {n} ok")).quietly());
         }
     }
-    Ok(report)
+    Ok(())
 }
 
 /// Every provider rig knows, whether or not it applies here.

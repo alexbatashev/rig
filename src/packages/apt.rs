@@ -41,7 +41,7 @@ impl PackageBackend for Apt {
 
     fn install(&mut self, names: &[String], policy: Policy) -> Result<()> {
         for name in names {
-            let (_, stderr, ok) = try_run(
+            let done = try_run(
                 &Cmd::new(
                     "apt-get",
                     &["install", "-y", "--no-install-recommends", name],
@@ -50,13 +50,13 @@ impl PackageBackend for Apt {
                 .as_root(),
                 policy,
             )?;
-            if ok {
+            if done.ok() {
                 continue;
             }
-            if stderr.contains("Unable to locate package") {
+            if done.stderr.contains("Unable to locate package") {
                 return Err(NotFound(name.clone()).into());
             }
-            anyhow::bail!("apt-get install {name} failed: {}", stderr.trim());
+            anyhow::bail!("apt-get install {name} failed with exit {}", done.code);
         }
         Ok(())
     }

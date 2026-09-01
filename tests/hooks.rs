@@ -158,9 +158,26 @@ fn only_an_etc_write_still_triggers_the_hook() {
 }
 
 #[test]
-fn verbose_shows_hook_output() {
+fn hook_output_streams_to_stderr() {
     let sb = sandbox();
     sb.fake_bin("hookrun", "#!/bin/sh\necho reloaded-$1\n");
-    let run = sb.rig(&["up", "--host", "box", "-y", "-v", sb.repo.to_str().unwrap()]);
-    assert!(run.stdout.contains("reloaded-a"), "{}", run.stdout);
+    let run = up(&sb, &[]);
+    assert!(
+        run.stderr.contains("> /bin/sh -c hookrun a"),
+        "{}",
+        run.stderr
+    );
+    assert!(run.stderr.contains("    reloaded-a"), "{}", run.stderr);
+    assert!(!run.stdout.contains("reloaded-a"), "{}", run.stdout);
+}
+
+#[test]
+fn file_rows_print_before_the_hook_runs() {
+    let sb = sandbox();
+    sb.fake_bin("hookrun", "#!/bin/sh\necho reloaded-$1\n");
+    let repo = sb.repo.to_str().unwrap().to_string();
+    let text = sb.rig_merged(&["up", "--host", "box", "-y", &repo]);
+    let created = text.find("created    ~/.config/a.conf").unwrap();
+    let hook = text.find("reloaded-a").unwrap();
+    assert!(created < hook, "{text}");
 }

@@ -108,8 +108,13 @@ impl PackageBackend for Mise {
         Ok(installed_names(&out).intersection(names).cloned().collect())
     }
 
-    fn install(&mut self, _names: &[String], policy: Policy) -> Result<()> {
-        run(&Cmd::new("mise", &["install"]).env("MISE_YES", "1"), policy)?;
+    fn install(&mut self, names: &[String], policy: Policy) -> Result<()> {
+        run(
+            &Cmd::new("mise", &["install"])
+                .with(names)
+                .env("MISE_YES", "1"),
+            policy,
+        )?;
         Ok(())
     }
 

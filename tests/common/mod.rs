@@ -206,14 +206,53 @@ impl Sandbox {
         write_script(&self.root.path().join("bin").join(name), script);
     }
 
+    /// Runs rig in the sandbox. `/etc` and `/var/lib/rig` always live under `etc_root()`,
+    /// so a test can never read or write the real machine's state.
     pub fn rig(&self, args: &[&str]) -> Run {
+        let out = self.command(args).output().unwrap();
+        Run {
+            status: out.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }
+    }
+
+    /// Like `rig`, but stderr is folded into stdout in the order the process wrote them.
+    #[must_use]
+    pub fn rig_merged(&self, args: &[&str]) -> String {
+        let cmd = self.command(args);
+        let program = cmd.get_program().to_os_string();
+        let rig_args: Vec<_> = cmd.get_args().map(std::ffi::OsStr::to_os_string).collect();
+        let mut sh = Command::new("sh");
+        sh.arg("-c")
+            .arg("exec \"$@\" 2>&1")
+            .arg("sh")
+            .arg(program)
+            .args(rig_args)
+            .current_dir(self.root.path());
+        for (k, v) in cmd.get_envs() {
+            match v {
+                Some(v) => sh.env(k, v),
+                None => sh.env_remove(k),
+            };
+        }
+        String::from_utf8_lossy(&sh.output().unwrap().stdout).into_owned()
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let etc_root = self.etc_root();
+        let mut args: Vec<&str> = args.to_vec();
+        if !args.contains(&"--etc-root") {
+            args.push("--etc-root");
+            args.push(etc_root.to_str().unwrap());
+        }
         let path = format!(
             "{}:{}",
             self.root.path().join("bin").display(),
             self.root.path().join("sysbin").display()
         );
-        let out = Command::new(env!("CARGO_BIN_EXE_rig"))
-            .args(args)
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rig"));
+        cmd.args(&args)
             .current_dir(self.root.path())
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", self.root.path().join("config"))
@@ -231,14 +270,8 @@ impl Sandbox {
             .env_remove("MISE_SHELL")
             .env_remove("MISE_DATA_DIR")
             .env_remove("EDITOR")
-            .env_remove("VISUAL")
-            .output()
-            .unwrap();
-        Run {
-            status: out.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        }
+            .env_remove("VISUAL");
+        cmd
     }
 }
 

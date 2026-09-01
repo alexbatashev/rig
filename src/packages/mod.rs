@@ -104,8 +104,8 @@ pub fn sync(
     state: &mut State,
     store: &Store,
     opts: Options,
-) -> Result<Report> {
-    let mut report = Report::default();
+    report: &mut Report,
+) -> Result<()> {
     for name in &sel.absent {
         report.push(
             Row::new("package", name)
@@ -127,17 +127,20 @@ pub fn sync(
         if !backend.available() {
             report.push(
                 Row::new("skipped", &format!("packages: {kind}"))
-                    .module(&format!("{kind} tool not on PATH")),
+                    .module(&format!("{kind} tool not on PATH"))
+                    .exit(1),
             );
             continue;
         }
-        step(backend.as_mut(), &want, tracked, state, opts, &mut report);
+        step(backend.as_mut(), &want, tracked, state, opts, report);
         if let Some(casks) = backend.casks() {
             state.macos_casks = casks;
         }
-        store.save(state)?;
+        if !opts.dry_run {
+            store.save(state)?;
+        }
     }
-    Ok(report)
+    Ok(())
 }
 
 fn error_row(kind: Backend, e: &anyhow::Error) -> Row {

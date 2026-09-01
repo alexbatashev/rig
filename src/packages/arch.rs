@@ -1,5 +1,5 @@
 use super::{names_of, NotFound, PackageBackend};
-use crate::exec::{run, run_capture, try_run, which, Cmd, Policy};
+use crate::exec::{query, run, run_capture, try_run, which, Cmd, Policy};
 use crate::repo::Backend;
 use anyhow::{bail, Result};
 use std::collections::BTreeSet;
@@ -37,11 +37,12 @@ impl PackageBackend for Arch {
     }
 
     fn install(&mut self, names: &[String], policy: Policy) -> Result<()> {
-        let (_, stderr, _) = try_run(
+        let probe = query(
             &Cmd::new("pacman", &["-Sp", "--print-format", "%n"]).with(names),
             policy,
         )?;
-        let aur: Vec<String> = stderr
+        let aur: Vec<String> = probe
+            .stderr
             .lines()
             .filter_map(|l| l.trim().strip_prefix("error: target not found: "))
             .map(ToString::to_string)
@@ -60,19 +61,19 @@ impl PackageBackend for Arch {
                 bail!("no AUR helper (yay or paru) for: {}", aur.join(", "));
             };
             for name in &aur {
-                let (_, stderr, ok) = try_run(
+                let done = try_run(
                     &Cmd::new(helper, &["-S", "--needed", "--noconfirm", name]),
                     policy,
                 )?;
-                if ok {
+                if done.ok() {
                     continue;
                 }
-                if stderr.contains("target not found")
-                    || stderr.contains("Could not find all required packages")
+                if done.stderr.contains("target not found")
+                    || done.stderr.contains("Could not find all required packages")
                 {
                     return Err(NotFound(name.clone()).into());
                 }
-                bail!("{helper} -S {name} failed: {}", stderr.trim());
+                bail!("{helper} -S {name} failed with exit {}", done.code);
             }
         }
         Ok(())
