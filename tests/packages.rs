@@ -721,6 +721,30 @@ fn dry_run_queries_only() {
         "{:?}",
         sb.log()
     );
+    assert!(!sb.state_dir().join("manifest.toml").exists());
+}
+
+#[test]
+fn adopted_blob_survives_the_package_phase() {
+    let sb = sandbox("linux:arch");
+    sb.set_installed(&["ghostty", "ripgrep"]);
+    sb.write_home(".config/tools.conf", "answer = 41\n");
+    let run = up(&sb, &["--adopt"]);
+    let note = run
+        .stdout
+        .lines()
+        .find(|l| l.contains("~/.config/tools.conf"))
+        .unwrap();
+    let hash8 = note.rsplit(' ').next().unwrap();
+    let blobs: Vec<String> = std::fs::read_dir(sb.state_dir().join("blobs"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    let kept = blobs.iter().find(|b| b.starts_with(hash8)).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(sb.state_dir().join("blobs").join(kept)).unwrap(),
+        "answer = 41\n"
+    );
 }
 
 #[test]
