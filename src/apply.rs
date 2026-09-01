@@ -19,6 +19,10 @@ impl Disk for RealDisk {
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
     }
+
+    fn link_target(&self, target: &Target) -> Option<std::path::PathBuf> {
+        std::fs::read_link(target.resolve(&self.roots)).ok()
+    }
 }
 
 fn record(state: &mut State, store: &Store, plan: &Plan, content: &[u8], mode: u32) -> Result<()> {

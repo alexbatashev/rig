@@ -5,14 +5,17 @@ use crate::repo::Target;
 use crate::state::{BlobSource, Hash, State};
 use anyhow::Result;
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 
 /// Reads what is currently on disk for a target.
 pub trait Disk {
-    /// `None` means the file is absent.
+    /// `None` means the file is absent. A dangling symlink reads as absent.
     ///
     /// # Errors
     /// When the file exists but cannot be read.
     fn read(&self, target: &Target) -> Result<Option<Vec<u8>>>;
+    /// Where the path points when it is a symlink, which means someone else owns it.
+    fn link_target(&self, target: &Target) -> Option<PathBuf>;
 }
 
 #[derive(Clone, Debug, Default)]
@@ -66,6 +69,8 @@ pub enum Action {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConflictKind {
     UnmanagedDiffers,
+    /// The path is a symlink rig never wrote, whatever it points at.
+    ForeignSymlink,
     Merge,
     MissingBlob,
 }
@@ -156,19 +161,27 @@ fn plan_for(
 
     let (Some(entry), Some(k)) = (entry, on_disk.as_ref()) else {
         return Ok(match (entry, on_disk) {
-            // cell 1
-            (None, None) => mk(Outcome::Created, write(d)),
-            // cell 4
-            (Some(_), None) => {
-                if forced {
-                    mk(Outcome::Created, write(d))
-                } else {
-                    mk(Outcome::Deleted, Action::Nothing)
-                }
-            }
+            // cells 1 and 4: absent is absent, whether or not rig wrote it once.
+            (None | Some(_), None) => mk(Outcome::Created, write(d)),
             // cell 2 and 3
             (None, Some(k)) => {
-                if Hash::of(&k) == dh {
+                if let Some(link) = disk.link_target(&target) {
+                    if opts.adopt || forced {
+                        let mut p = mk(Outcome::Adopted, write(d));
+                        p.note = Some(format!("was a symlink to {}", link.display()));
+                        p
+                    } else {
+                        let mut p = mk(
+                            Outcome::Conflict(ConflictKind::ForeignSymlink),
+                            Action::Nothing,
+                        );
+                        p.note = Some(format!(
+                            "symlink to {}; rig up --adopt {target} replaces it",
+                            link.display()
+                        ));
+                        p
+                    }
+                } else if Hash::of(&k) == dh {
                     mk(
                         Outcome::Adopted,
                         Action::Record {
@@ -303,10 +316,13 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[derive(Default)]
-    struct MemDisk(BTreeMap<Target, Vec<u8>>);
+    struct MemDisk(BTreeMap<Target, Vec<u8>>, BTreeMap<Target, PathBuf>);
     impl Disk for MemDisk {
         fn read(&self, target: &Target) -> Result<Option<Vec<u8>>> {
             Ok(self.0.get(target).cloned())
+        }
+        fn link_target(&self, target: &Target) -> Option<PathBuf> {
+            self.1.get(target).cloned()
         }
     }
 
@@ -367,6 +383,11 @@ mod tests {
         fn on_disk(mut self, content: &str) -> Case {
             self.disk.0.insert(target(), content.as_bytes().to_vec());
             self
+        }
+
+        fn linked_to(mut self, content: &str, link: &str) -> Case {
+            self.disk.1.insert(target(), PathBuf::from(link));
+            self.on_disk(content)
         }
 
         fn run(&self, d: &str) -> Plan {
@@ -438,19 +459,26 @@ mod tests {
     }
 
     #[test]
-    fn cell4_deleted() {
+    fn cell4_recreates() {
         let p = Case::new().last_written("D\n").run("D\n");
-        assert_eq!(p.outcome, Outcome::Deleted);
-        assert_eq!(p.action, Action::Nothing);
+        assert_eq!(p.outcome, Outcome::Created);
+        assert_eq!(written(&p).0, b"D\n");
     }
 
     #[test]
-    fn cell4_force_recreates() {
-        let mut c = Case::new().last_written("D\n");
-        c.opts.force = Force::All;
+    fn symlink_is_foreign_until_adopted() {
+        let c = Case::new().linked_to("D\n", "/nix/store/x/D");
         let p = c.run("D\n");
-        assert_eq!(p.outcome, Outcome::Created);
+        assert_eq!(p.outcome, Outcome::Conflict(ConflictKind::ForeignSymlink));
+        assert_eq!(p.action, Action::Nothing);
+        assert!(p.note.unwrap().contains("/nix/store/x/D"));
+
+        let mut c = Case::new().linked_to("K\n", "/nix/store/x/D");
+        c.opts.adopt = true;
+        let p = c.run("D\n");
+        assert_eq!(p.outcome, Outcome::Adopted);
         assert_eq!(written(&p).0, b"D\n");
+        assert!(p.preserve.is_none());
     }
 
     #[test]

@@ -160,18 +160,49 @@ fn cell2_adoption_keeps_the_repo_mode() {
 }
 
 #[test]
-fn cell4_deleted_on_disk_and_force_recreates() {
+fn cell4_recreates_a_deleted_file() {
     let sb = home_only();
     up(&sb, &[]);
     std::fs::remove_file(sb.home.join(GHOSTTY)).unwrap();
     let run = sb.rig(&["up"]);
-    assert_eq!(run.outcome(GHOSTTY_TARGET).unwrap(), "deleted");
-    assert_eq!(run.status, 1);
-    assert!(!sb.home_exists(GHOSTTY));
+    assert_eq!(run.outcome(GHOSTTY_TARGET).unwrap(), "created");
+    assert_eq!(run.status, 0, "{}{}", run.stdout, run.stderr);
+    assert_eq!(
+        sb.read_home(GHOSTTY),
+        ghostty("JetBrains Darcula", "20", "epoll")
+    );
+}
 
-    let forced = sb.rig(&["up", "--force", GHOSTTY_TARGET]);
-    assert_eq!(forced.outcome(GHOSTTY_TARGET).unwrap(), "created");
-    assert!(sb.home_exists(GHOSTTY));
+#[test]
+fn symlink_is_reported_foreign_and_replaced_by_adopt() {
+    let sb = home_only();
+    let elsewhere = sb.root.path().join("store/ghostty-config");
+    std::fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
+    std::fs::write(&elsewhere, ghostty("JetBrains Darcula", "20", "epoll")).unwrap();
+    std::fs::create_dir_all(sb.home.join(".config/ghostty")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, sb.home.join(GHOSTTY)).unwrap();
+
+    let run = up(&sb, &[]);
+    assert_eq!(run.outcome(GHOSTTY_TARGET).unwrap(), "conflict");
+    assert_eq!(run.status, 1);
+    assert!(run.stdout.contains("symlink to"), "{}", run.stdout);
+    assert!(sb.home.join(GHOSTTY).is_symlink());
+
+    let adopted = up(&sb, &["--adopt"]);
+    assert_eq!(adopted.outcome(GHOSTTY_TARGET).unwrap(), "adopted");
+    assert!(!sb.home.join(GHOSTTY).is_symlink());
+    assert!(elsewhere.exists());
+    assert_eq!(
+        sb.read_home(GHOSTTY),
+        ghostty("JetBrains Darcula", "20", "epoll")
+    );
+
+    std::fs::remove_file(&elsewhere).unwrap();
+    std::fs::remove_file(sb.home.join(".config/git/config")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, sb.home.join(".config/git/config")).unwrap();
+    let dangling = up(&sb, &[]);
+    assert_eq!(dangling.outcome("~/.config/git/config").unwrap(), "created");
+    assert!(!sb.home.join(".config/git/config").is_symlink());
 }
 
 #[test]
