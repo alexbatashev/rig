@@ -7,12 +7,21 @@ printf 'defaults %s\n' "$*" >> "$FAKE_LOG"
 touch "$FAKE_DEFAULTS"
 case "$1" in
   read)
-    v=$(sed -n "s/^$2 $3 //p" "$FAKE_DEFAULTS")
+    v=$(sed -n "s/^$2 $3 [^ ]* //p" "$FAKE_DEFAULTS")
     [ -z "$v" ] && { echo "The domain/default pair of ($2, $3) does not exist" >&2; exit 1; }
     echo "$v" ;;
+  read-type)
+    case $(sed -n "s/^$2 $3 \([^ ]*\) .*/\1/p" "$FAKE_DEFAULTS") in
+      -int) echo "Type is integer" ;;
+      -bool) echo "Type is boolean" ;;
+      -float) echo "Type is float" ;;
+      *) echo "Type is string" ;;
+    esac ;;
   write)
     grep -v "^$2 $3 " "$FAKE_DEFAULTS" > "$FAKE_DEFAULTS.t"; mv "$FAKE_DEFAULTS.t" "$FAKE_DEFAULTS"
-    echo "$2 $3 $5" >> "$FAKE_DEFAULTS" ;;
+    echo "$2 $3 $4 $5" >> "$FAKE_DEFAULTS" ;;
+  delete)
+    grep -v "^$2 $3 " "$FAKE_DEFAULTS" > "$FAKE_DEFAULTS.t"; mv "$FAKE_DEFAULTS.t" "$FAKE_DEFAULTS" ;;
 esac
 exit 0
 "#;
@@ -29,9 +38,17 @@ fn sandbox(os: &str) -> Sandbox {
     sb
 }
 
+/// Sets a value the way the user would, typed by its shape.
 fn set_machine(sb: &Sandbox, domain: &str, key: &str, value: &str) {
+    let flag = if value.parse::<i64>().is_ok() {
+        "-int"
+    } else if value.parse::<f64>().is_ok() {
+        "-float"
+    } else {
+        "-string"
+    };
     let db = sb.root.path().join("fake.defaults");
-    let prefix = format!("{domain} {key} ");
+    let prefix = format!("{domain} {key} {flag} ");
     let mut lines: Vec<String> = std::fs::read_to_string(&db)
         .unwrap_or_default()
         .lines()
@@ -72,7 +89,9 @@ fn first_up_sets_then_idles() {
     assert_eq!(run.stdout.matches("(set)").count(), 3, "{}", run.stdout);
     let m = std::fs::read_to_string(sb.state_dir().join("manifest.toml")).unwrap();
     assert!(
-        m.contains("\"macos:NSGlobalDomain.InitialKeyRepeat\" = \"15\""),
+        m.contains(
+            "[settings.\"macos:NSGlobalDomain.InitialKeyRepeat\"]\ncurrent = \"15\"\nunset = true"
+        ),
         "{m}"
     );
 
@@ -180,23 +199,89 @@ fn types_round_trip() {
 }
 
 #[test]
-fn dropped_key_leaves_machine_and_state() {
+fn dropped_key_restores_the_original() {
     let sb = sandbox("macos");
+    set_machine(&sb, "NSGlobalDomain", "InitialKeyRepeat", "25");
     up(&sb, &[]);
+    let m = std::fs::read_to_string(sb.state_dir().join("manifest.toml")).unwrap();
+    assert!(
+        m.contains("[settings.\"macos:NSGlobalDomain.InitialKeyRepeat\".original]\nvalue = \"25\"\nkind = \"integer\""),
+        "{m}"
+    );
+
     sb.write_repo(
         "modules/a/module.toml",
         "[defaults.NSGlobalDomain]\nKeyRepeat = 1\n",
     );
     std::fs::write(sb.log_path(), "").unwrap();
-    up(&sb, &[]);
+    let run = up(&sb, &[]);
+    assert_eq!(run.status, 0, "{}{}", run.stdout, run.stderr);
     assert!(
-        sb.log().iter().all(|l| !l.contains("delete")),
+        run.stdout
+            .contains("restored   NSGlobalDomain.InitialKeyRepeat")
+            && run
+                .stdout
+                .contains("restored   NSGlobalDomain.ApplePressAndHoldEnabled"),
+        "{}",
+        run.stdout
+    );
+    assert_eq!(
+        writes(&sb),
+        vec!["defaults write NSGlobalDomain InitialKeyRepeat -int 25"]
+    );
+    assert!(
+        sb.log()
+            .contains(&"defaults delete NSGlobalDomain ApplePressAndHoldEnabled".to_string()),
         "{:?}",
         sb.log()
     );
     let m = std::fs::read_to_string(sb.state_dir().join("manifest.toml")).unwrap();
     assert!(!m.contains("InitialKeyRepeat"), "{m}");
+    assert!(!m.contains("ApplePressAndHoldEnabled"), "{m}");
     assert!(m.contains("KeyRepeat"), "{m}");
+
+    std::fs::write(sb.log_path(), "").unwrap();
+    let again = up(&sb, &[]);
+    assert_eq!(again.stdout, "nothing to do\n");
+    assert!(writes(&sb).is_empty(), "{:?}", sb.log());
+}
+
+#[test]
+fn legacy_ledger_entry_is_reported_and_kept() {
+    let sb = sandbox("macos");
+    up(&sb, &[]);
+    let path = sb.state_dir().join("manifest.toml");
+    let m = std::fs::read_to_string(&path).unwrap();
+    let start = m
+        .find("[settings.\"macos:NSGlobalDomain.InitialKeyRepeat\"]")
+        .unwrap();
+    let end = m[start + 1..]
+        .find("\n[")
+        .map_or(m.len(), |i| start + 1 + i);
+    let m = format!(
+        "{}[settings]\n\"macos:NSGlobalDomain.InitialKeyRepeat\" = \"15\"\n{}",
+        &m[..start],
+        &m[end..]
+    );
+    std::fs::write(&path, m).unwrap();
+
+    sb.write_repo(
+        "modules/a/module.toml",
+        "[defaults.NSGlobalDomain]\nKeyRepeat = 1\nApplePressAndHoldEnabled = false\n",
+    );
+    std::fs::write(sb.log_path(), "").unwrap();
+    let run = up(&sb, &[]);
+    assert_eq!(run.status, 1, "{}{}", run.stdout, run.stderr);
+    assert!(
+        run.stdout
+            .contains("orphaned   NSGlobalDomain.InitialKeyRepeat")
+            && run.stdout.contains("original unknown, kept"),
+        "{}",
+        run.stdout
+    );
+    assert!(writes(&sb).is_empty(), "{:?}", sb.log());
+    let m = std::fs::read_to_string(&path).unwrap();
+    assert!(!m.contains("InitialKeyRepeat"), "{m}");
 }
 
 #[test]

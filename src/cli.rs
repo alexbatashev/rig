@@ -752,8 +752,8 @@ fn diff(roots: &Roots, path: Option<&str>, host: Option<&str>) -> Result<i32> {
                 println!(
                     "{}: {} -> {}",
                     item.label(),
-                    item.machine.as_deref().unwrap_or("unset"),
-                    item.desired
+                    item.machine.as_ref().map_or("unset", |m| m.value.as_str()),
+                    item.desired.value
                 );
             }
         }
