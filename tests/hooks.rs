@@ -67,6 +67,33 @@ fn failed_hook_exit_2_others_still_run() {
 }
 
 #[test]
+fn failed_hook_retries_on_next_up() {
+    let sb = sandbox();
+    sb.fake_bin("hookfail", HOOKFAIL);
+    sb.write_repo(
+        "modules/a/module.toml",
+        "[[hook]]\nafter = \"hookfail a\"\n",
+    );
+    let run = up(&sb, &[]);
+    assert_eq!(run.status, 2, "{}{}", run.stdout, run.stderr);
+    let m = std::fs::read_to_string(sb.state_dir().join("manifest.toml")).unwrap();
+    assert!(m.contains("failed_hooks = [\"a: hookfail a\"]"), "{m}");
+
+    // Nothing changed, but the hook is due again; this time it succeeds.
+    sb.fake_bin("hookfail", HOOKRUN);
+    std::fs::write(sb.log_path(), "").unwrap();
+    let run = up(&sb, &[]);
+    assert_eq!(run.status, 0, "{}{}", run.stdout, run.stderr);
+    assert!(sb.log().contains(&"hook a".to_string()), "{:?}", sb.log());
+    let m = std::fs::read_to_string(sb.state_dir().join("manifest.toml")).unwrap();
+    assert!(!m.contains("failed_hooks"), "{m}");
+
+    std::fs::write(sb.log_path(), "").unwrap();
+    up(&sb, &[]);
+    assert!(!sb.log().contains(&"hook a".to_string()), "{:?}", sb.log());
+}
+
+#[test]
 fn dry_run_lists_hooks() {
     let sb = sandbox();
     let run = up(&sb, &["-n"]);

@@ -4,7 +4,7 @@ use crate::absorb::{absorb, equivalent, summary, AbsorbEdit, Lower, TopLayer};
 use crate::apply::{apply, dry_row, RealDisk};
 use crate::compose::{compose, desired, layers, Desired, Layer};
 use crate::exec::{is_root, Confirm, Policy};
-use crate::hooks::{self, run_hooks};
+use crate::hooks::{self, run_hooks, HookRun, HookStatus};
 use crate::packages;
 use crate::reconcile::{reconcile, Action, Disk, Force, Options, Outcome, Plan};
 use crate::repo::{load, select, Os, Repo, Roots, Selection, Sync, Target, KNOWN_OS_TAGS};
@@ -523,9 +523,23 @@ fn sync_machine(
     )?;
     let written = written_by_module(&report.rows[..before], roots);
     let visible = report.rows.iter().any(|r| !r.quiet);
-    let runs = run_hooks(&sel, &written, &roots.home, args.dry_run);
+    let runs = run_hooks(
+        &sel,
+        &written,
+        &state.failed_hooks,
+        &roots.home,
+        args.dry_run,
+    );
     for row in hooks::rows(&runs, visible) {
         report.push(row);
+    }
+    if !args.dry_run {
+        state.failed_hooks = runs
+            .iter()
+            .filter(|r| matches!(r.status, HookStatus::Failed(_)))
+            .map(HookRun::key)
+            .collect();
+        store.save(state)?;
     }
     Ok(())
 }

@@ -3,7 +3,7 @@
 use crate::exec::{try_run, Cmd, Policy};
 use crate::repo::{HookWhen, Selection};
 use crate::report::Row;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,11 +21,21 @@ pub struct HookRun {
     pub status: HookStatus,
 }
 
-/// Runs each active module's hooks in host order, after files and packages.
+impl HookRun {
+    /// How the ledger names this hook.
+    #[must_use]
+    pub fn key(&self) -> String {
+        format!("{}: {}", self.module, self.command)
+    }
+}
+
+/// Runs each active module's hooks in host order, after files and packages. A hook
+/// whose last run failed is due again whatever its `when`.
 #[must_use]
 pub fn run_hooks(
     sel: &Selection,
     changed: &BTreeMap<String, Vec<PathBuf>>,
+    failed_before: &BTreeSet<String>,
     home: &Path,
     dry_run: bool,
 ) -> Vec<HookRun> {
@@ -33,15 +43,18 @@ pub fn run_hooks(
     for m in &sel.modules {
         let wrote = changed.get(&m.name).map_or(&[][..], Vec::as_slice);
         for hook in &m.hooks {
-            let wanted = hook.when == HookWhen::Always || !wrote.is_empty();
             let mut run = HookRun {
                 module: m.name.clone(),
                 command: hook.after.clone(),
-                status: match (wanted, dry_run) {
-                    (false, _) => HookStatus::Skipped,
-                    (true, true) => HookStatus::WouldRun,
-                    (true, false) => HookStatus::Ran,
-                },
+                status: HookStatus::Skipped,
+            };
+            let wanted = hook.when == HookWhen::Always
+                || !wrote.is_empty()
+                || failed_before.contains(&run.key());
+            run.status = match (wanted, dry_run) {
+                (false, _) => HookStatus::Skipped,
+                (true, true) => HookStatus::WouldRun,
+                (true, false) => HookStatus::Ran,
             };
             if run.status == HookStatus::Ran {
                 run.status = execute(&run, home, &sel.host, wrote);

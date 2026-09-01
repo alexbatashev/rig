@@ -102,6 +102,8 @@ pub struct State {
     pub macos_casks: BTreeSet<String>,
     /// `provider:domain.key` to what rig wrote and what it found.
     pub settings: BTreeMap<String, Setting>,
+    /// `module: command` for every hook whose last run failed, so it runs again.
+    pub failed_hooks: BTreeSet<String>,
 }
 
 /// Reads content that `reconcile` needs as the diff3 ancestor.
@@ -228,6 +230,8 @@ struct Manifest {
     packages_meta: Option<MetaToml>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     settings: BTreeMap<String, SettingToml>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    failed_hooks: BTreeSet<String>,
 }
 
 pub struct Store {
@@ -306,6 +310,7 @@ impl Store {
             packages: m.packages.into_iter().map(|(b, t)| (b, t.into())).collect(),
             macos_casks: m.packages_meta.unwrap_or_default().macos_casks,
             settings: m.settings.into_iter().map(|(k, s)| (k, s.into())).collect(),
+            failed_hooks: m.failed_hooks,
         };
         Ok((store, state))
     }
@@ -346,6 +351,7 @@ impl Store {
                 .iter()
                 .map(|(k, s)| (k.clone(), s.into()))
                 .collect(),
+            failed_hooks: state.failed_hooks.clone(),
             packages_meta: (!state.macos_casks.is_empty()).then(|| MetaToml {
                 macos_casks: state.macos_casks.clone(),
             }),
