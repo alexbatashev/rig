@@ -46,19 +46,19 @@ impl PackageBackend for Brew {
 
     fn install(&mut self, names: &[String], policy: Policy) -> Result<()> {
         for name in names {
-            let (_, stderr, ok) = try_run(&Cmd::new("brew", &["install", name]), policy)?;
-            if ok {
+            let done = try_run(&Cmd::new("brew", &["install", name]), policy)?;
+            if done.ok() {
                 continue;
             }
-            if !missing_formula(&stderr) {
-                anyhow::bail!("brew install {name} failed: {}", stderr.trim());
+            if !missing_formula(&done.stderr) {
+                anyhow::bail!("brew install {name} failed: {}", done.reason());
             }
-            let (_, stderr, ok) = try_run(&Cmd::new("brew", &["install", "--cask", name]), policy)?;
-            if !ok {
-                if missing_formula(&stderr) {
+            let done = try_run(&Cmd::new("brew", &["install", "--cask", name]), policy)?;
+            if !done.ok() {
+                if missing_formula(&done.stderr) {
                     return Err(NotFound(name.clone()).into());
                 }
-                anyhow::bail!("brew install --cask {name} failed: {}", stderr.trim());
+                anyhow::bail!("brew install --cask {name} failed: {}", done.reason());
             }
             self.casks.insert(name.clone());
         }

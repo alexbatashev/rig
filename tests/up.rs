@@ -160,18 +160,49 @@ fn cell2_adoption_keeps_the_repo_mode() {
 }
 
 #[test]
-fn cell4_deleted_on_disk_and_force_recreates() {
+fn cell4_recreates_a_deleted_file() {
     let sb = home_only();
     up(&sb, &[]);
     std::fs::remove_file(sb.home.join(GHOSTTY)).unwrap();
     let run = sb.rig(&["up"]);
-    assert_eq!(run.outcome(GHOSTTY_TARGET).unwrap(), "deleted");
-    assert_eq!(run.status, 1);
-    assert!(!sb.home_exists(GHOSTTY));
+    assert_eq!(run.outcome(GHOSTTY_TARGET).unwrap(), "created");
+    assert_eq!(run.status, 0, "{}{}", run.stdout, run.stderr);
+    assert_eq!(
+        sb.read_home(GHOSTTY),
+        ghostty("JetBrains Darcula", "20", "epoll")
+    );
+}
 
-    let forced = sb.rig(&["up", "--force", GHOSTTY_TARGET]);
-    assert_eq!(forced.outcome(GHOSTTY_TARGET).unwrap(), "created");
-    assert!(sb.home_exists(GHOSTTY));
+#[test]
+fn symlink_is_reported_foreign_and_replaced_by_adopt() {
+    let sb = home_only();
+    let elsewhere = sb.root.path().join("store/ghostty-config");
+    std::fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
+    std::fs::write(&elsewhere, ghostty("JetBrains Darcula", "20", "epoll")).unwrap();
+    std::fs::create_dir_all(sb.home.join(".config/ghostty")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, sb.home.join(GHOSTTY)).unwrap();
+
+    let run = up(&sb, &[]);
+    assert_eq!(run.outcome(GHOSTTY_TARGET).unwrap(), "conflict");
+    assert_eq!(run.status, 1);
+    assert!(run.stdout.contains("symlink to"), "{}", run.stdout);
+    assert!(sb.home.join(GHOSTTY).is_symlink());
+
+    let adopted = up(&sb, &["--adopt"]);
+    assert_eq!(adopted.outcome(GHOSTTY_TARGET).unwrap(), "adopted");
+    assert!(!sb.home.join(GHOSTTY).is_symlink());
+    assert!(elsewhere.exists());
+    assert_eq!(
+        sb.read_home(GHOSTTY),
+        ghostty("JetBrains Darcula", "20", "epoll")
+    );
+
+    std::fs::remove_file(&elsewhere).unwrap();
+    std::fs::remove_file(sb.home.join(".config/git/config")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, sb.home.join(".config/git/config")).unwrap();
+    let dangling = up(&sb, &[]);
+    assert_eq!(dangling.outcome("~/.config/git/config").unwrap(), "created");
+    assert!(!sb.home.join(".config/git/config").is_symlink());
 }
 
 #[test]
@@ -360,6 +391,22 @@ fn repo_path_remembered() {
 }
 
 #[test]
+fn default_repo_path_is_available_to_hooks() {
+    let sb = Sandbox::with_fixture("hooks");
+    sb.fake_bin(
+        "hookrun",
+        "#!/bin/sh\ncat \"$XDG_CONFIG_HOME/rig/repo\" >> \"$FAKE_LOG\"\n",
+    );
+    std::os::unix::fs::symlink(&sb.repo, sb.home.join("dotfiles")).unwrap();
+
+    let run = sb.rig(&["up", "--host", "box", "-y"]);
+
+    assert_eq!(run.status, 0, "{}{}", run.stdout, run.stderr);
+    let remembered = sb.repo.canonicalize().unwrap().display().to_string();
+    assert_eq!(sb.log(), vec![remembered.clone(), remembered]);
+}
+
+#[test]
 fn no_repo_configured_is_an_error() {
     let sb = Sandbox::new();
     let run = sb.rig(&["up"]);
@@ -371,9 +418,15 @@ fn no_repo_configured_is_an_error() {
 
 const NVIDIA: &str = "etc/modprobe.d/nvidia.conf";
 
+/// An arch host whose packages are all present, so only the `/etc` phase has work to do.
 fn etc_sandbox(sudo: &str) -> Sandbox {
     let sb = Sandbox::with_fixture("basic").with_os("linux:arch");
     sb.fake_bin("sudo", sudo);
+    sb.fake_bin(
+        "pacman",
+        "#!/bin/sh\ncase \"$1\" in -Qq) cat \"$FAKE_INSTALLED\";; esac\nexit 0\n",
+    );
+    sb.set_installed(&["fish", "starship", "ghostty", "nvidia-open-dkms"]);
     sb
 }
 
@@ -414,6 +467,52 @@ fn etc_escalates_through_sudo() {
     );
     // The home phase ran too.
     assert!(sb.home_exists(GHOSTTY));
+}
+
+#[test]
+fn etc_only_change_prints_the_child_rows_and_nothing_else() {
+    let sb = etc_sandbox(FAKE_SUDO);
+    etc_up(&sb, &[]);
+    sb.write_repo(
+        "modules/nvidia/etc/modprobe.d/nvidia.conf",
+        "options nvidia_drm modeset=0\n",
+    );
+    let run = etc_up(&sb, &[]);
+    assert_eq!(run.status, 0, "{}{}", run.stdout, run.stderr);
+    assert!(
+        run.stdout
+            .contains("updated    /etc/modprobe.d/nvidia.conf"),
+        "{}",
+        run.stdout
+    );
+    assert!(!run.stdout.contains("nothing to do"), "{}", run.stdout);
+}
+
+#[test]
+fn prune_forgets_a_foreign_symlink_instead_of_deleting_it() {
+    let sb = home_only();
+    up(&sb, &[]);
+    let elsewhere = sb.root.path().join("store/gitignore");
+    std::fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
+    std::fs::copy(sb.home.join(".gitignore_default"), &elsewhere).unwrap();
+    std::fs::remove_file(sb.home.join(".gitignore_default")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, sb.home.join(".gitignore_default")).unwrap();
+    std::fs::remove_file(sb.repo.join("modules/git/home/.gitignore_default")).unwrap();
+
+    let run = up(&sb, &["--prune"]);
+    assert_eq!(run.outcome("~/.gitignore_default").unwrap(), "orphaned");
+    assert!(
+        run.stdout.contains("foreign symlink, kept"),
+        "{}",
+        run.stdout
+    );
+    assert!(sb.home.join(".gitignore_default").is_symlink());
+    let again = up(&sb, &["--prune"]);
+    assert!(
+        again.outcome("~/.gitignore_default").is_none(),
+        "{}",
+        again.stdout
+    );
 }
 
 #[test]

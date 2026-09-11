@@ -4,7 +4,7 @@ use crate::absorb::{absorb, equivalent, summary, AbsorbEdit, Lower, TopLayer};
 use crate::apply::{apply, dry_row, RealDisk};
 use crate::compose::{compose, desired, layers, Desired, Layer};
 use crate::exec::{is_root, Confirm, Policy};
-use crate::hooks::{self, run_hooks};
+use crate::hooks::{self, run_hooks, HookRun, HookStatus};
 use crate::packages;
 use crate::reconcile::{reconcile, Action, Disk, Force, Options, Outcome, Plan};
 use crate::repo::{load, select, Os, Repo, Roots, Selection, Sync, Target, KNOWN_OS_TAGS};
@@ -259,7 +259,13 @@ fn repo_path(source: Option<&Path>, remember: bool) -> Result<PathBuf> {
     }
     let default = home()?.join("dotfiles");
     if default.is_dir() {
-        return Ok(default);
+        let abs = default.canonicalize()?;
+        if remember {
+            let dir = config_dir()?;
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join("repo"), format!("{}\n", abs.display()))?;
+        }
+        return Ok(abs);
     }
     bail!("no repo: run rig up <path> or rig init")
 }
@@ -389,13 +395,6 @@ fn plan_for(
     reconcile(items, state, &disk, blobs, opts)
 }
 
-fn print_report(report: &Report, verbose: bool) -> Result<()> {
-    let mut out = std::io::stdout().lock();
-    report.print(&mut out, verbose)?;
-    out.flush()?;
-    Ok(())
-}
-
 fn up(args: &UpArgs, roots: &Roots, etc_root: Option<&Path>) -> Result<i32> {
     // SAFETY-free: geteuid has no preconditions.
     if !args.etc_only && unsafe { libc::geteuid() } == 0 && std::env::var_os("SUDO_USER").is_some()
@@ -410,17 +409,28 @@ fn up(args: &UpArgs, roots: &Roots, etc_root: Option<&Path>) -> Result<i32> {
         prune: args.prune,
     };
     let items = session.desired()?;
+    let mut report = Report::live(args.verbose);
     if args.dry_run {
         println!("(dry run)");
     }
 
     if args.etc_only {
-        let report = apply_phase(&items, roots, &etc_state_dir(etc_root), true, args)?;
-        print_report(&report, args.verbose)?;
+        let (store, mut state) = Store::open(&etc_state_dir(etc_root))?;
+        apply_phase(&items, roots, &store, &mut state, true, args, &mut report)?;
+        report.finish();
         return Ok(report.exit());
     }
 
-    let mut report = apply_phase(&items, roots, &home_state_dir()?, false, args)?;
+    let (home_store, mut home_state) = Store::open(&home_state_dir()?)?;
+    apply_phase(
+        &items,
+        roots,
+        &home_store,
+        &mut home_state,
+        false,
+        args,
+        &mut report,
+    )?;
 
     let (etc_store, etc_state) = Store::open(&etc_state_dir(etc_root))?;
     let etc: Vec<Plan> = plan_for(&items, roots, &etc_store, &etc_state, &opts)?
@@ -443,17 +453,20 @@ fn up(args: &UpArgs, roots: &Roots, etc_root: Option<&Path>) -> Result<i32> {
     if !actionable.is_empty() && !args.dry_run {
         if is_root() {
             let mut state = etc_state;
-            let applied = apply(&actionable, roots, &etc_store, &mut state, false)?;
-            print_report(&applied, args.verbose)?;
-            exit = exit.max(applied.exit());
-            for row in applied.rows {
-                report.push(row.quietly());
-            }
+            apply(
+                &actionable,
+                roots,
+                &etc_store,
+                &mut state,
+                false,
+                &mut report,
+            )?;
         } else {
-            let code = escalate(args, &session, etc_root, actionable.len())?;
+            let code = escalate(args, &session, etc_root, actionable.len(), &mut report)?;
             exit = exit.max(code);
             // The child printed its own rows; keep them here only so hooks see the writes.
             if code < 2 {
+                report.shown_elsewhere(actionable.len());
                 for p in &actionable {
                     report.push(Row::from_plan(p).quietly());
                 }
@@ -461,8 +474,16 @@ fn up(args: &UpArgs, roots: &Roots, etc_root: Option<&Path>) -> Result<i32> {
         }
     }
 
-    sync_machine(args, &session, &opts, roots, &mut report)?;
-    print_report(&report, args.verbose)?;
+    sync_machine(
+        args,
+        &session,
+        &opts,
+        roots,
+        &home_store,
+        &mut home_state,
+        &mut report,
+    )?;
+    report.finish();
     Ok(exit.max(report.exit()))
 }
 
@@ -472,58 +493,68 @@ fn sync_machine(
     session: &Session,
     opts: &Options,
     roots: &Roots,
+    store: &Store,
+    state: &mut State,
     report: &mut Report,
 ) -> Result<()> {
     let policy = Policy {
         no_sudo: args.no_sudo,
-        verbose: args.verbose,
     };
     let sel = session.selection()?;
-    let (home_store, mut home_state) = Store::open(&home_state_dir()?)?;
-    let settings_before = home_state.settings.clone();
-    let settings = settings::sync(
+    settings::sync(
         &settings::providers(),
         &sel,
-        &mut home_state,
+        state,
         settings::Options {
             policy,
             dry_run: args.dry_run,
             force: matches!(opts.force, Force::All),
         },
+        report,
     )?;
-    if home_state.settings != settings_before {
-        home_store.save(&home_state)?;
+    if !args.dry_run {
+        store.save(state)?;
     }
-    for row in settings.rows {
-        report.push(row);
-    }
-    let packages = packages::sync(
+    let before = report.rows.len();
+    packages::sync(
         &sel,
         &session.os,
-        &mut home_state,
-        &home_store,
+        state,
+        store,
         packages::Options {
             confirm: Confirm { yes: args.yes },
             policy,
             dry_run: args.dry_run,
         },
+        report,
     )?;
-    let written = written_by_module(report, roots);
-    let visible = report.rows.iter().chain(&packages.rows).any(|r| !r.quiet);
-    let runs = run_hooks(&sel, &written, &roots.home, args.dry_run);
-    for row in packages.rows {
+    let written = written_by_module(&report.rows[..before], roots);
+    let visible = report.rows.iter().any(|r| !r.quiet);
+    let runs = run_hooks(
+        &sel,
+        &written,
+        &state.failed_hooks,
+        &roots.home,
+        args.dry_run,
+    );
+    for row in hooks::rows(&runs, visible) {
         report.push(row);
     }
-    for row in hooks::rows(&runs, visible, args.verbose) {
-        report.push(row);
+    if !args.dry_run {
+        state.failed_hooks = runs
+            .iter()
+            .filter(|r| matches!(r.status, HookStatus::Failed(_)))
+            .map(HookRun::key)
+            .collect();
+        store.save(state)?;
     }
     Ok(())
 }
 
 /// The absolute paths `up` wrote, grouped by owning module, for `RIG_CHANGED`.
-fn written_by_module(report: &Report, roots: &Roots) -> BTreeMap<String, Vec<PathBuf>> {
+fn written_by_module(rows: &[Row], roots: &Roots) -> BTreeMap<String, Vec<PathBuf>> {
     let mut out: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
-    for row in &report.rows {
+    for row in rows {
         let (Some(module), Ok(target)) = (row.module.as_ref(), row.target.parse::<Target>()) else {
             continue;
         };
@@ -544,21 +575,22 @@ fn changes_disk_or_state(plan: &Plan) -> bool {
 fn apply_phase(
     items: &[Desired],
     roots: &Roots,
-    state_dir: &Path,
+    store: &Store,
+    state: &mut State,
     etc: bool,
     args: &UpArgs,
-) -> Result<Report> {
+    report: &mut Report,
+) -> Result<()> {
     let opts = Options {
         force: force_from(args, roots)?,
         adopt: args.adopt,
         prune: args.prune,
     };
-    let (store, mut state) = Store::open(state_dir)?;
-    let plans: Vec<Plan> = plan_for(items, roots, &store, &state, &opts)?
+    let plans: Vec<Plan> = plan_for(items, roots, store, state, &opts)?
         .into_iter()
         .filter(|p| p.target.is_etc() == etc)
         .collect();
-    apply(&plans, roots, &store, &mut state, args.dry_run)
+    apply(&plans, roots, store, state, args.dry_run, report)
 }
 
 fn escalate(
@@ -566,6 +598,7 @@ fn escalate(
     session: &Session,
     etc_root: Option<&Path>,
     count: usize,
+    report: &mut Report,
 ) -> Result<i32> {
     use std::io::IsTerminal;
     let hint = format!(
@@ -573,25 +606,19 @@ fn escalate(
         session.host,
         session.repo.root.display()
     );
-    let needs_root = || -> Result<i32> {
-        let mut r = Report::default();
-        r.push(Row::new("needs-root", &hint).exit(1));
-        print_report(&r, args.verbose)?;
-        Ok(1)
-    };
-    if args.no_sudo {
-        return needs_root();
-    }
     let batch = !std::io::stdin().is_terminal();
     // Probe first, so sudo's own refusal is never confused with the child's exit code.
-    if batch
-        && !std::process::Command::new("sudo")
-            .args(["-n", "--", "true"])
-            .status()
-            .context("running sudo")?
-            .success()
-    {
-        return needs_root();
+    let refused = || -> Result<bool> {
+        Ok(batch
+            && !std::process::Command::new("sudo")
+                .args(["-n", "--", "true"])
+                .status()
+                .context("running sudo")?
+                .success())
+    };
+    if args.no_sudo || refused()? {
+        report.push(Row::new("needs-root", &hint).exit(1));
+        return Ok(1);
     }
     eprintln!("escalating: {count} /etc targets need root");
     let mut cmd = std::process::Command::new("sudo");
@@ -632,27 +659,29 @@ fn status(roots: &Roots, host: Option<&str>, verbose: bool) -> Result<i32> {
     let session = open(None, host, false)?;
     let items = session.desired()?;
     let opts = Options::default();
-    let mut report = Report::default();
+    let mut rows = Vec::new();
     for (dir, etc) in state_dirs(roots)? {
         let (store, state) = Store::open(&dir)?;
         for p in plan_for(&items, roots, &store, &state, &opts)? {
             if p.target.is_etc() == etc {
-                report.push(Row::from_plan(&p));
+                rows.push(Row::from_plan(&p));
             }
         }
     }
-    report.rows.sort_by(|a, b| a.target.cmp(&b.target));
+    rows.sort_by(|a, b| a.target.cmp(&b.target));
+    let mut report = Report::live(verbose);
+    for row in rows {
+        report.push(row);
+    }
     let (_, state) = Store::open(&home_state_dir()?)?;
-    let settings = settings::status(
+    settings::status(
         &settings::providers(),
         &session.selection()?,
         &state,
         Policy::default(),
+        &mut report,
     )?;
-    for row in settings.rows {
-        report.push(row);
-    }
-    print_report(&report, verbose)?;
+    report.finish();
     Ok(report.exit())
 }
 
@@ -744,8 +773,8 @@ fn diff(roots: &Roots, path: Option<&str>, host: Option<&str>) -> Result<i32> {
                 println!(
                     "{}: {} -> {}",
                     item.label(),
-                    item.machine.as_deref().unwrap_or("unset"),
-                    item.desired
+                    item.machine.as_ref().map_or("unset", |m| m.value.as_str()),
+                    item.desired.value
                 );
             }
         }
@@ -1060,7 +1089,7 @@ fn absorb_cmd(
             .with_context(|| format!("not managed: {p}; use rig adopt {p} --module <m>"))?]
     };
 
-    let mut report = Report::default();
+    let mut report = Report::live(verbose);
     for d in chosen {
         if all && sel.module(&d.module).map(|m| m.sync) == Some(Sync::Manual) {
             report.push(
@@ -1090,9 +1119,6 @@ fn absorb_cmd(
             }
             Err(e) => return Err(e),
         }
-    }
-    if !report.rows.is_empty() {
-        print_report(&report, verbose)?;
     }
     Ok(report.exit())
 }
@@ -1199,13 +1225,12 @@ fn adopt(
     );
     store.save(&state)?;
 
-    let mut report = Report::default();
+    let mut report = Report::live(false);
     report.push(
         Row::new("adopted", &target.to_string())
             .module(module)
             .note(&format!("-> {}", session.rel(&dest))),
     );
-    print_report(&report, false)?;
     Ok(0)
 }
 
@@ -1245,7 +1270,7 @@ fn resolve(
     let items = session.desired()?;
     let only = path.map(|p| resolve_target(p, roots)).transpose()?;
     let mut exit = 0;
-    let mut report = Report::default();
+    let mut report = Report::live(false);
     let mut pending_etc = 0;
 
     for (dir, etc) in state_dirs(roots)? {
@@ -1300,7 +1325,7 @@ fn resolve(
     if pending_etc > 0 {
         exit = exit.max(escalate_resolve(&session, path, etc_root)?);
     }
-    print_report(&report, false)?;
+    report.finish();
     Ok(exit.max(report.exit()))
 }
 

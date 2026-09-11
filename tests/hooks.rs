@@ -67,6 +67,33 @@ fn failed_hook_exit_2_others_still_run() {
 }
 
 #[test]
+fn failed_hook_retries_on_next_up() {
+    let sb = sandbox();
+    sb.fake_bin("hookfail", HOOKFAIL);
+    sb.write_repo(
+        "modules/a/module.toml",
+        "[[hook]]\nafter = \"hookfail a\"\n",
+    );
+    let run = up(&sb, &[]);
+    assert_eq!(run.status, 2, "{}{}", run.stdout, run.stderr);
+    let m = std::fs::read_to_string(sb.state_dir().join("manifest.toml")).unwrap();
+    assert!(m.contains("failed_hooks = [\"a: hookfail a\"]"), "{m}");
+
+    // Nothing changed, but the hook is due again; this time it succeeds.
+    sb.fake_bin("hookfail", HOOKRUN);
+    std::fs::write(sb.log_path(), "").unwrap();
+    let run = up(&sb, &[]);
+    assert_eq!(run.status, 0, "{}{}", run.stdout, run.stderr);
+    assert!(sb.log().contains(&"hook a".to_string()), "{:?}", sb.log());
+    let m = std::fs::read_to_string(sb.state_dir().join("manifest.toml")).unwrap();
+    assert!(!m.contains("failed_hooks"), "{m}");
+
+    std::fs::write(sb.log_path(), "").unwrap();
+    up(&sb, &[]);
+    assert!(!sb.log().contains(&"hook a".to_string()), "{:?}", sb.log());
+}
+
+#[test]
 fn dry_run_lists_hooks() {
     let sb = sandbox();
     let run = up(&sb, &["-n"]);
@@ -158,9 +185,26 @@ fn only_an_etc_write_still_triggers_the_hook() {
 }
 
 #[test]
-fn verbose_shows_hook_output() {
+fn hook_output_streams_to_stderr() {
     let sb = sandbox();
     sb.fake_bin("hookrun", "#!/bin/sh\necho reloaded-$1\n");
-    let run = sb.rig(&["up", "--host", "box", "-y", "-v", sb.repo.to_str().unwrap()]);
-    assert!(run.stdout.contains("reloaded-a"), "{}", run.stdout);
+    let run = up(&sb, &[]);
+    assert!(
+        run.stderr.contains("> /bin/sh -c hookrun a"),
+        "{}",
+        run.stderr
+    );
+    assert!(run.stderr.contains("    reloaded-a"), "{}", run.stderr);
+    assert!(!run.stdout.contains("reloaded-a"), "{}", run.stdout);
+}
+
+#[test]
+fn file_rows_print_before_the_hook_runs() {
+    let sb = sandbox();
+    sb.fake_bin("hookrun", "#!/bin/sh\nsleep 0.2\necho reloaded-$1\n");
+    let repo = sb.repo.to_str().unwrap().to_string();
+    let text = sb.rig_merged(&["up", "--host", "box", "-y", &repo]);
+    let created = text.find("created    ~/.config/a.conf").unwrap();
+    let hook = text.find("reloaded-a").unwrap();
+    assert!(created < hook, "{text}");
 }

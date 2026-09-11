@@ -123,7 +123,10 @@ mod arch {
             sb.log()
         );
         let m = manifest(&sb);
-        assert!(m.contains("arch = [\"ghostty\", \"ripgrep\"]"), "{m}");
+        assert!(
+            m.contains("[packages.arch]\nghostty = \"installed\"\nripgrep = \"installed\""),
+            "{m}"
+        );
         assert!(run.stdout.contains("package"), "{}", run.stdout);
     }
 
@@ -155,6 +158,38 @@ mod arch {
         let log = sb.log().join("\n");
         assert!(log.contains("pacman -Rns --noconfirm ghostty"), "{log}");
         assert!(!log.contains("vim"), "{log}");
+    }
+
+    #[test]
+    fn preinstalled_package_is_adopted_and_kept_on_removal() {
+        let sb = sandbox("linux:arch");
+        sb.set_installed(&["ghostty", "ripgrep"]);
+        let first = up(&sb, &[]);
+        assert_eq!(first.status, 0, "{}{}", first.stdout, first.stderr);
+        assert!(!first.stdout.contains("adopted"), "{}", first.stdout);
+        let m = manifest(&sb);
+        assert!(
+            m.contains("[packages.arch]\nghostty = \"adopted\"\nripgrep = \"adopted\""),
+            "{m}"
+        );
+
+        sb.write_repo(
+            "modules/tools/module.toml",
+            "[packages]\narch = [\"ripgrep\"]\n",
+        );
+        std::fs::write(sb.log_path(), "").unwrap();
+        let run = up(&sb, &[]);
+        assert_eq!(run.status, 0, "{}{}", run.stdout, run.stderr);
+        assert!(
+            run.stdout.contains("orphaned   arch: ghostty"),
+            "{}",
+            run.stdout
+        );
+        assert!(!sb.log().join("\n").contains("-Rns"), "{:?}", sb.log());
+        assert!(!manifest(&sb).contains("ghostty"), "{}", manifest(&sb));
+
+        let again = up(&sb, &[]);
+        assert_eq!(again.stdout, "nothing to do\n");
     }
 
     #[test]
@@ -226,7 +261,7 @@ mod apt {
             "{:?}",
             sb.log()
         );
-        assert!(manifest(&sb).contains("ubuntu = [\"ghostty\"]"));
+        assert!(manifest(&sb).contains("[packages.ubuntu]\nghostty = \"installed\""));
     }
 
     #[test]
@@ -458,13 +493,16 @@ mod mise {
         assert_eq!(run.status, 0, "{}{}", run.stdout, run.stderr);
         assert_eq!(
             mise_calls(&sb),
-            vec!["mise ls --json --installed", "mise install"]
+            vec![
+                "mise ls --json --installed",
+                "mise install gh npm:@anthropic-ai/claude-code"
+            ]
         );
         assert_eq!(rig_toml(&sb).as_deref(), Some(RIG_TOML));
         assert!(run.stdout.contains("mise: gh"), "{}", run.stdout);
         let m = manifest(&sb);
         assert!(
-            m.contains("mise = [\"gh\", \"npm:@anthropic-ai/claude-code\"]"),
+            m.contains("[packages.mise]\ngh = \"installed\"\n\"npm:@anthropic-ai/claude-code\" = \"installed\""),
             "{m}"
         );
 
@@ -494,22 +532,32 @@ mod mise {
     }
 
     #[test]
-    fn preinstalled_tool_is_never_tracked_or_removed() {
+    fn preinstalled_tool_is_adopted_and_never_removed() {
         let sb = sandbox("linux:arch");
         sb.write_repo("modules/tools/module.toml", MODULE);
         sb.set_mise_json(r#"{"npm:@anthropic-ai/claude-code":[{"installed":true}]}"#);
         up(&sb, &[]);
         let m = manifest(&sb);
-        assert!(m.contains("mise = [\"gh\"]"), "{m}");
+        assert!(
+            m.contains("[packages.mise]\ngh = \"installed\"\n\"npm:@anthropic-ai/claude-code\" = \"adopted\""),
+            "{m}"
+        );
 
         sb.write_repo("modules/tools/module.toml", "[packages]\nmise = []\n");
         std::fs::write(sb.log_path(), "").unwrap();
-        up(&sb, &[]);
+        let run = up(&sb, &[]);
         assert!(
             !sb.log().iter().any(|l| l.starts_with("mise uninstall")),
             "{:?}",
             sb.log()
         );
+        assert!(
+            run.stdout
+                .contains("orphaned   mise: npm:@anthropic-ai/claude-code"),
+            "{}",
+            run.stdout
+        );
+        assert!(!manifest(&sb).contains("claude-code"), "{}", manifest(&sb));
     }
 
     #[test]
@@ -612,9 +660,9 @@ mod canonical {
             let run = up(&sb, &[]);
             assert_eq!(run.status, 0, "{}{}", run.stdout, run.stderr);
             let log = sb.log().join("\n");
-            assert!(log.contains("mise install"), "{os}: {log}");
+            assert!(log.contains("mise install gh"), "{os}: {log}");
             assert!(
-                !log.contains("install gh") && !log.contains("noconfirm gh"),
+                !log.contains("brew install gh") && !log.contains("noconfirm gh"),
                 "{os}: {log}"
             );
         }
@@ -717,6 +765,67 @@ fn dry_run_queries_only() {
         sb.log().iter().all(|l| !l.starts_with("pacman -S ")),
         "{:?}",
         sb.log()
+    );
+    assert!(!sb.state_dir().join("manifest.toml").exists());
+
+    up(&sb, &[]);
+    let before = manifest(&sb);
+    sb.write_repo(
+        "modules/tools/module.toml",
+        "[packages]\narch = [\"vim\"]\n",
+    );
+    up(&sb, &["-n"]);
+    assert_eq!(manifest(&sb), before);
+}
+
+#[test]
+fn declined_prompt_still_records_adoptions() {
+    let sb = sandbox("linux:arch");
+    sb.set_installed(&["ghostty"]);
+    let repo = sb.repo.to_str().unwrap().to_string();
+    let run = sb.rig(&["up", "--host", "box", &repo]);
+    assert_eq!(run.status, 1, "{}{}", run.stdout, run.stderr);
+    assert!(
+        manifest(&sb).contains("ghostty = \"adopted\""),
+        "{}",
+        manifest(&sb)
+    );
+}
+
+#[test]
+fn reinstalling_an_adopted_package_keeps_it_adopted() {
+    let sb = sandbox("linux:arch");
+    sb.set_installed(&["ghostty", "ripgrep"]);
+    up(&sb, &[]);
+    sb.set_installed(&["ripgrep"]);
+    up(&sb, &[]);
+    assert!(
+        manifest(&sb).contains("ghostty = \"adopted\""),
+        "{}",
+        manifest(&sb)
+    );
+}
+
+#[test]
+fn adopted_blob_survives_the_package_phase() {
+    let sb = sandbox("linux:arch");
+    sb.set_installed(&["ghostty", "ripgrep"]);
+    sb.write_home(".config/tools.conf", "answer = 41\n");
+    let run = up(&sb, &["--adopt"]);
+    let note = run
+        .stdout
+        .lines()
+        .find(|l| l.contains("~/.config/tools.conf"))
+        .unwrap();
+    let hash8 = note.rsplit(' ').next().unwrap();
+    let blobs: Vec<String> = std::fs::read_dir(sb.state_dir().join("blobs"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    let kept = blobs.iter().find(|b| b.starts_with(hash8)).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(sb.state_dir().join("blobs").join(kept)).unwrap(),
+        "answer = 41\n"
     );
 }
 

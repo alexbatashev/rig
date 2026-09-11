@@ -1,13 +1,22 @@
-//! System settings rig reconciles the way it does files: read, compare, write what differs.
+//! System settings rig reconciles the way it does files: read, compare, write what differs,
+//! and put back what was there when a setting leaves the repo.
 
 pub mod macos;
 
 use crate::exec::Policy;
 use crate::repo::Selection;
 use crate::report::{Report, Row};
-use crate::state::State;
+use crate::state::{Original, Setting, State};
 use anyhow::Result;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+/// A value as the settings tool reports it, with the type it would need to write it back.
+/// No type means rig can read it but never write it back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Observed {
+    pub value: String,
+    pub kind: Option<String>,
+}
 
 pub trait Provider {
     fn name(&self) -> &'static str;
@@ -16,12 +25,18 @@ pub trait Provider {
     ///
     /// # Errors
     /// When the settings tool cannot be queried.
-    fn read(&self, domain: &str, key: &str, policy: Policy) -> Result<Option<String>>;
+    fn read(&self, domain: &str, key: &str, policy: Policy) -> Result<Option<Observed>>;
     /// # Errors
     /// When the write fails.
-    fn write(&self, domain: &str, key: &str, value: &toml::Value, policy: Policy) -> Result<()>;
+    fn write(&self, domain: &str, key: &str, value: &Observed, policy: Policy) -> Result<()>;
+    /// # Errors
+    /// When the delete fails.
+    fn delete(&self, domain: &str, key: &str, policy: Policy) -> Result<()>;
     /// What `read` returns once `value` is written.
-    fn normalise(&self, value: &toml::Value) -> String;
+    ///
+    /// # Errors
+    /// When the declared value is not something this provider can write.
+    fn desired(&self, value: &toml::Value) -> Result<Observed>;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -46,9 +61,8 @@ pub struct Item {
     pub provider: &'static str,
     pub domain: String,
     pub key: String,
-    pub value: toml::Value,
-    pub desired: String,
-    pub machine: Option<String>,
+    pub desired: Observed,
+    pub machine: Option<Observed>,
     pub outcome: Outcome,
 }
 
@@ -61,6 +75,10 @@ impl Item {
 
     fn state_key(&self) -> String {
         format!("{}:{}", self.provider, self.label())
+    }
+
+    fn machine_value(&self) -> Option<&str> {
+        self.machine.as_ref().map(|m| m.value.as_str())
     }
 }
 
@@ -105,7 +123,11 @@ pub fn plan(
                 }
             }
         }
-        if wanted.is_empty() {
+        let owned = state
+            .settings
+            .keys()
+            .any(|k| k.starts_with(&format!("{}:", p.name())));
+        if wanted.is_empty() && !owned {
             continue;
         }
         if !p.available() {
@@ -113,19 +135,21 @@ pub fn plan(
             continue;
         }
         for ((domain, key), value) in wanted {
-            let desired = p.normalise(&value);
+            let desired = p.desired(&value)?;
             let machine = p.read(&domain, &key, policy)?;
             let mut item = Item {
                 provider: p.name(),
                 domain,
                 key,
-                value,
                 desired,
                 machine,
                 outcome: Outcome::Ok,
             };
-            let ledger = state.settings.get(&item.state_key()).map(String::as_str);
-            item.outcome = outcome(ledger, item.machine.as_deref(), &item.desired);
+            let ledger = state
+                .settings
+                .get(&item.state_key())
+                .map(|s| s.current.as_str());
+            item.outcome = outcome(ledger, item.machine_value(), &item.desired.value);
             items.push(item);
         }
     }
@@ -136,7 +160,8 @@ fn rows_for_unavailable(unavailable: &[&str], report: &mut Report) {
     for name in unavailable {
         report.push(
             Row::new("skipped", &format!("settings: {name}"))
-                .module(&format!("{name} tool not on PATH")),
+                .module(&format!("{name} tool not on PATH"))
+                .exit(1),
         );
     }
 }
@@ -150,10 +175,10 @@ pub fn status(
     sel: &Selection,
     state: &State,
     policy: Policy,
-) -> Result<Report> {
+    report: &mut Report,
+) -> Result<()> {
     let (items, unavailable) = plan(providers, sel, state, policy)?;
-    let mut report = Report::default();
-    rows_for_unavailable(&unavailable, &mut report);
+    rows_for_unavailable(&unavailable, report);
     for item in &items {
         match item.outcome {
             Outcome::Edited => report.push(edited_row(item)),
@@ -161,28 +186,102 @@ pub fn status(
                 Row::new("setting", &item.label())
                     .module(&format!(
                         "pending: {}, repo: {}",
-                        item.machine.as_deref().unwrap_or("unset"),
-                        item.desired
+                        item.machine_value().unwrap_or("unset"),
+                        item.desired.value
                     ))
                     .exit(1),
             ),
             Outcome::Ok | Outcome::Adopted => {}
         }
     }
-    Ok(report)
+    for (key, setting) in &state.settings {
+        if items.iter().all(|i| i.state_key() != *key) && !skipped(key, &unavailable) {
+            report.push(
+                Row::new(
+                    "setting",
+                    key.split_once(':').map_or(key.as_str(), |(_, l)| l),
+                )
+                .module(&format!("pending: restore {}", setting.original.describe()))
+                .exit(1),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn skipped(key: &str, unavailable: &[&str]) -> bool {
+    unavailable
+        .iter()
+        .any(|p| key.starts_with(&format!("{p}:")))
 }
 
 fn edited_row(item: &Item) -> Row {
     Row::new("setting", &item.label())
         .module(&format!(
             "edited: {}, repo: {}",
-            item.machine.as_deref().unwrap_or("unset"),
-            item.desired
+            item.machine_value().unwrap_or("unset"),
+            item.desired.value
         ))
         .exit(1)
 }
 
-/// Writes the settings that differ and records every one rig now owns.
+fn error_row(label: &str, e: &anyhow::Error) -> Row {
+    Row::new("error", &format!("setting {label}"))
+        .note(&format!("{e:#}"))
+        .exit(2)
+}
+
+/// Puts back what a setting was before rig, once it is no longer declared.
+fn restore(
+    providers: &[Box<dyn Provider>],
+    key: &str,
+    setting: &Setting,
+    opts: Options,
+    report: &mut Report,
+) -> bool {
+    let (name, label) = key.split_once(':').unwrap_or(("", key));
+    let Some(p) = providers.iter().find(|p| p.name() == name) else {
+        return false;
+    };
+    let action = match (&setting.original, &setting.domain, &setting.key) {
+        (Original::Value(v), Some(_), Some(_)) if v.kind.is_some() => "restore",
+        (Original::Unset, Some(_), Some(_)) => "delete",
+        _ => "forget",
+    };
+    if opts.dry_run {
+        report.push(Row::new("setting", label).module(&format!("would {action}")));
+        return false;
+    }
+    if action == "forget" {
+        report.push(
+            Row::new("orphaned", label)
+                .note("original unknown, kept")
+                .exit(1),
+        );
+        return true;
+    }
+    let (domain, k) = (
+        setting.domain.as_deref().unwrap_or_default(),
+        setting.key.as_deref().unwrap_or_default(),
+    );
+    let done = match &setting.original {
+        Original::Value(v) => p.write(domain, k, v, opts.policy),
+        _ => p.delete(domain, k, opts.policy),
+    };
+    match done {
+        Ok(()) => {
+            report.push(Row::new("restored", label).module(&setting.original.describe()));
+            true
+        }
+        Err(e) => {
+            report.push(error_row(label, &e));
+            false
+        }
+    }
+}
+
+/// Writes the settings that differ, restores the ones that left the repo, and records
+/// every one rig now owns.
 ///
 /// # Errors
 /// When a provider cannot be queried.
@@ -194,10 +293,10 @@ pub fn sync(
     sel: &Selection,
     state: &mut State,
     opts: Options,
-) -> Result<Report> {
+    report: &mut Report,
+) -> Result<()> {
     let (items, unavailable) = plan(providers, sel, state, opts.policy)?;
-    let mut report = Report::default();
-    rows_for_unavailable(&unavailable, &mut report);
+    rows_for_unavailable(&unavailable, report);
     let mut ok: BTreeMap<&str, usize> = BTreeMap::new();
     let mut declared: BTreeMap<&str, usize> = BTreeMap::new();
     let provider = |name: &str| providers.iter().find(|p| p.name() == name).unwrap();
@@ -225,34 +324,49 @@ pub fn sync(
         }
         if write {
             if let Err(e) =
-                provider(item.provider).write(&item.domain, &item.key, &item.value, opts.policy)
+                provider(item.provider).write(&item.domain, &item.key, &item.desired, opts.policy)
             {
-                report.push(
-                    Row::new("error", &format!("setting {}", item.label()))
-                        .note(&format!("{e:#}"))
-                        .exit(2),
-                );
+                report.push(error_row(&item.label(), &e));
                 continue;
             }
         }
-        state
-            .settings
-            .insert(item.state_key(), item.desired.clone());
+        let original = match (state.settings.get(&item.state_key()), &item.machine) {
+            (Some(prev), _) => prev.original.clone(),
+            (None, None) => Original::Unset,
+            (None, Some(m)) if m.kind.is_some() => Original::Value(m.clone()),
+            (None, Some(_)) => Original::Unknown,
+        };
+        state.settings.insert(
+            item.state_key(),
+            Setting {
+                current: item.desired.value.clone(),
+                original,
+                domain: Some(item.domain.clone()),
+                key: Some(item.key.clone()),
+            },
+        );
         let mut row = Row::new("setting", &item.label()).module(label);
         row.quiet = !write;
         report.push(row);
     }
-    if !opts.dry_run {
-        let live: std::collections::BTreeSet<String> = items.iter().map(Item::state_key).collect();
-        let skipped = |k: &str| unavailable.iter().any(|p| k.starts_with(&format!("{p}:")));
-        state.settings.retain(|k, _| live.contains(k) || skipped(k));
+    let live: BTreeSet<String> = items.iter().map(Item::state_key).collect();
+    let gone: Vec<(String, Setting)> = state
+        .settings
+        .iter()
+        .filter(|(k, _)| !live.contains(*k) && !skipped(k, &unavailable))
+        .map(|(k, s)| (k.clone(), s.clone()))
+        .collect();
+    for (key, setting) in gone {
+        if restore(providers, &key, &setting, opts, report) {
+            state.settings.remove(&key);
+        }
     }
     for (name, n) in ok {
         if n == declared[name] {
             report.push(Row::new("setting", &format!("{name}: {n} ok")).quietly());
         }
     }
-    Ok(report)
+    Ok(())
 }
 
 /// Every provider rig knows, whether or not it applies here.

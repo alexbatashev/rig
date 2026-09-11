@@ -54,13 +54,56 @@ pub struct Entry {
     pub mode: u32,
 }
 
+/// How a package came to be in the ledger, which decides what leaving the repo means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Origin {
+    /// rig installed it, so rig removes it.
+    Installed,
+    /// It was already there when a module first listed it, so rig leaves it.
+    Adopted,
+}
+
+pub type Tracked = BTreeMap<String, Origin>;
+
+/// What a setting was before rig first wrote it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Original {
+    Value(crate::settings::Observed),
+    Unset,
+    /// Recorded before rig kept originals; nothing can be restored.
+    Unknown,
+}
+
+impl Original {
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Original::Value(v) => v.value.clone(),
+            Original::Unset => "unset".to_string(),
+            Original::Unknown => "unknown".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Setting {
+    /// What rig last wrote or adopted.
+    pub current: String,
+    pub original: Original,
+    pub domain: Option<String>,
+    pub key: Option<String>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct State {
     pub entries: BTreeMap<Target, Entry>,
-    pub packages: BTreeMap<Backend, BTreeSet<String>>,
+    pub packages: BTreeMap<Backend, Tracked>,
     pub macos_casks: BTreeSet<String>,
-    /// `provider:domain.key` to the value rig last wrote or adopted.
-    pub settings: BTreeMap<String, String>,
+    /// `provider:domain.key` to what rig wrote and what it found.
+    pub settings: BTreeMap<String, Setting>,
+    /// `module: command` for every hook whose last run failed, so it runs again.
+    pub failed_hooks: BTreeSet<String>,
 }
 
 /// Reads content that `reconcile` needs as the diff3 ancestor.
@@ -68,6 +111,80 @@ pub trait BlobSource {
     /// # Errors
     /// When the blob exists but cannot be read.
     fn blob(&self, hash: &Hash) -> Result<Option<Vec<u8>>>;
+}
+
+#[derive(Serialize, Deserialize)]
+struct OriginalToml {
+    value: String,
+    kind: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum SettingToml {
+    Full {
+        current: String,
+        /// Absent means unknown; `false` means the key was unset.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        original: Option<OriginalToml>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        unset: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        domain: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+    },
+    Legacy(String),
+}
+
+impl From<SettingToml> for Setting {
+    fn from(t: SettingToml) -> Setting {
+        match t {
+            SettingToml::Legacy(current) => Setting {
+                current,
+                original: Original::Unknown,
+                domain: None,
+                key: None,
+            },
+            SettingToml::Full {
+                current,
+                original,
+                unset,
+                domain,
+                key,
+            } => Setting {
+                current,
+                original: match original {
+                    Some(o) => Original::Value(crate::settings::Observed {
+                        value: o.value,
+                        kind: Some(o.kind),
+                    }),
+                    None if unset => Original::Unset,
+                    None => Original::Unknown,
+                },
+                domain,
+                key,
+            },
+        }
+    }
+}
+
+impl From<&Setting> for SettingToml {
+    fn from(s: &Setting) -> SettingToml {
+        SettingToml::Full {
+            current: s.current.clone(),
+            original: match &s.original {
+                Original::Value(v) => v.kind.as_ref().map(|kind| OriginalToml {
+                    value: v.value.clone(),
+                    kind: kind.clone(),
+                }),
+                _ => None,
+            },
+            unset: s.original == Original::Unset,
+            domain: s.domain.clone(),
+            key: s.key.clone(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -83,17 +200,38 @@ struct MetaToml {
     macos_casks: BTreeSet<String>,
 }
 
+/// A backend's ledger; the list form predates `Origin` and means "rig installed these".
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum TrackedToml {
+    Origins(Tracked),
+    Names(BTreeSet<String>),
+}
+
+impl From<TrackedToml> for Tracked {
+    fn from(t: TrackedToml) -> Tracked {
+        match t {
+            TrackedToml::Origins(m) => m,
+            TrackedToml::Names(names) => {
+                names.into_iter().map(|n| (n, Origin::Installed)).collect()
+            }
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Manifest {
     version: u32,
     #[serde(default)]
     targets: BTreeMap<String, EntryToml>,
     #[serde(default)]
-    packages: BTreeMap<Backend, BTreeSet<String>>,
+    packages: BTreeMap<Backend, TrackedToml>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     packages_meta: Option<MetaToml>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    settings: BTreeMap<String, String>,
+    settings: BTreeMap<String, SettingToml>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    failed_hooks: BTreeSet<String>,
 }
 
 pub struct Store {
@@ -169,9 +307,10 @@ impl Store {
         }
         let state = State {
             entries,
-            packages: m.packages,
+            packages: m.packages.into_iter().map(|(b, t)| (b, t.into())).collect(),
             macos_casks: m.packages_meta.unwrap_or_default().macos_casks,
-            settings: m.settings,
+            settings: m.settings.into_iter().map(|(k, s)| (k, s.into())).collect(),
+            failed_hooks: m.failed_hooks,
         };
         Ok((store, state))
     }
@@ -202,8 +341,17 @@ impl Store {
                     )
                 })
                 .collect(),
-            packages: state.packages.clone(),
-            settings: state.settings.clone(),
+            packages: state
+                .packages
+                .iter()
+                .map(|(b, t)| (*b, TrackedToml::Origins(t.clone())))
+                .collect(),
+            settings: state
+                .settings
+                .iter()
+                .map(|(k, s)| (k.clone(), s.into()))
+                .collect(),
+            failed_hooks: state.failed_hooks.clone(),
             packages_meta: (!state.macos_casks.is_empty()).then(|| MetaToml {
                 macos_casks: state.macos_casks.clone(),
             }),
@@ -330,15 +478,68 @@ mod tests {
                 mode: 0o644,
             },
         );
-        state
-            .packages
-            .insert(Backend::Arch, ["ghostty".to_string()].into());
+        state.packages.insert(
+            Backend::Arch,
+            [
+                ("ghostty".to_string(), Origin::Installed),
+                ("vim".to_string(), Origin::Adopted),
+            ]
+            .into(),
+        );
         store.save(&state).unwrap();
 
         let (store2, back) = Store::open(dir.path()).unwrap();
         assert_eq!(back.entries, state.entries);
         assert_eq!(back.packages, state.packages);
         assert_eq!(store2.blob(&hash).unwrap().unwrap(), b"content\n");
+    }
+
+    #[test]
+    fn settings_round_trip_and_legacy_strings_read_as_unknown() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (store, mut state) = Store::open(dir.path()).unwrap();
+        let value = Setting {
+            current: "1".into(),
+            original: Original::Value(crate::settings::Observed {
+                value: "2".into(),
+                kind: Some("integer".into()),
+            }),
+            domain: Some("NSGlobalDomain".into()),
+            key: Some("KeyRepeat".into()),
+        };
+        let unset = Setting {
+            original: Original::Unset,
+            ..value.clone()
+        };
+        state.settings.insert("macos:a.b".into(), value);
+        state.settings.insert("macos:a.c".into(), unset);
+        store.save(&state).unwrap();
+        let (_, back) = Store::open(dir.path()).unwrap();
+        assert_eq!(back.settings, state.settings);
+
+        std::fs::write(
+            dir.path().join("manifest.toml"),
+            "version = 1\n[settings]\n\"macos:a.b\" = \"1\"\n",
+        )
+        .unwrap();
+        let (_, legacy) = Store::open(dir.path()).unwrap();
+        assert_eq!(legacy.settings["macos:a.b"].original, Original::Unknown);
+        assert_eq!(legacy.settings["macos:a.b"].current, "1");
+    }
+
+    #[test]
+    fn legacy_package_lists_read_as_installed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("manifest.toml"),
+            "version = 1\n[packages]\narch = [\"ghostty\"]\n",
+        )
+        .unwrap();
+        let (_, state) = Store::open(dir.path()).unwrap();
+        assert_eq!(
+            state.packages[&Backend::Arch],
+            [("ghostty".to_string(), Origin::Installed)].into()
+        );
     }
 
     #[test]

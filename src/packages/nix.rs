@@ -1,5 +1,5 @@
 use super::{NotFound, PackageBackend};
-use crate::exec::{run, run_capture, try_run, which, Cmd, Policy};
+use crate::exec::{query, run, run_capture, try_run, which, Cmd, Policy};
 use crate::repo::Backend;
 use anyhow::Result;
 use std::collections::BTreeSet;
@@ -44,8 +44,8 @@ impl PackageBackend for Nix {
 
     fn available(&self) -> bool {
         which("nix")
-            && try_run(&Cmd::new("nix", &["profile", "list"]), Policy::default())
-                .is_ok_and(|(_, _, ok)| ok)
+            && query(&Cmd::new("nix", &["profile", "list"]), Policy::default())
+                .is_ok_and(|d| d.ok())
     }
 
     fn version(&self, policy: Policy) -> Option<String> {
@@ -66,29 +66,29 @@ impl PackageBackend for Nix {
 
     fn install(&mut self, names: &[String], policy: Policy) -> Result<()> {
         for name in names {
-            let (_, stderr, ok) = try_run(&Cmd::new("nix", &["profile", "install", name]), policy)?;
-            if ok {
+            let done = try_run(&Cmd::new("nix", &["profile", "install", name]), policy)?;
+            if done.ok() {
                 continue;
             }
-            if stderr.contains("does not provide attribute") {
+            if done.stderr.contains("does not provide attribute") {
                 return Err(NotFound(name.clone()).into());
             }
-            anyhow::bail!("nix profile install {name} failed: {}", stderr.trim());
+            anyhow::bail!("nix profile install {name} failed: {}", done.reason());
         }
         Ok(())
     }
 
     fn remove(&mut self, names: &[String], policy: Policy) -> Result<()> {
         let short: Vec<String> = names.iter().map(|n| short_name(n)).collect();
-        let (_, stderr, ok) = try_run(
+        let done = try_run(
             &Cmd::new("nix", &["profile", "remove"]).with(&short),
             policy,
         )?;
-        if ok {
+        if done.ok() {
             return Ok(());
         }
-        if !stderr.contains("unknown element") {
-            anyhow::bail!("nix profile remove failed: {}", stderr.trim());
+        if !done.stderr.contains("unknown element") {
+            anyhow::bail!("nix profile remove failed: {}", done.reason());
         }
         for name in &short {
             run(
