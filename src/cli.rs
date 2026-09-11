@@ -259,7 +259,13 @@ fn repo_path(source: Option<&Path>, remember: bool) -> Result<PathBuf> {
     }
     let default = home()?.join("dotfiles");
     if default.is_dir() {
-        return Ok(default);
+        let abs = default.canonicalize()?;
+        if remember {
+            let dir = config_dir()?;
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join("repo"), format!("{}\n", abs.display()))?;
+        }
+        return Ok(abs);
     }
     bail!("no repo: run rig up <path> or rig init")
 }

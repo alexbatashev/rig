@@ -391,6 +391,22 @@ fn repo_path_remembered() {
 }
 
 #[test]
+fn default_repo_path_is_available_to_hooks() {
+    let sb = Sandbox::with_fixture("hooks");
+    sb.fake_bin(
+        "hookrun",
+        "#!/bin/sh\ncat \"$XDG_CONFIG_HOME/rig/repo\" >> \"$FAKE_LOG\"\n",
+    );
+    std::os::unix::fs::symlink(&sb.repo, sb.home.join("dotfiles")).unwrap();
+
+    let run = sb.rig(&["up", "--host", "box", "-y"]);
+
+    assert_eq!(run.status, 0, "{}{}", run.stdout, run.stderr);
+    let remembered = sb.repo.canonicalize().unwrap().display().to_string();
+    assert_eq!(sb.log(), vec![remembered.clone(), remembered]);
+}
+
+#[test]
 fn no_repo_configured_is_an_error() {
     let sb = Sandbox::new();
     let run = sb.rig(&["up"]);
